@@ -16,9 +16,9 @@ The first version does not support sentence translation, selected-text capture, 
 
 ## Interface Rules
 
-- Use a normal opaque GTK window.
+- Use a lightly translucent GTK window so text behind the lookup surface remains faintly visible.
 - Keep the interface plain, fast, and keyboard-friendly.
-- Do not add transparency, blur, animation, decorative gradients, floating effects, or other visual effects that do not directly improve lookup speed or readability.
+- Do not add blur, animation, decorative gradients, floating effects, or other visual effects that do not directly improve lookup speed or readability.
 
 ## Dependencies
 
@@ -26,6 +26,7 @@ The first version does not support sentence translation, selected-text capture, 
 - CMake
 - pkg-config
 - GTK4
+- gtk4-layer-shell
 - libsoup 3
 - json-glib
 - SQLite
@@ -35,13 +36,13 @@ The first version does not support sentence translation, selected-text capture, 
 On Arch Linux:
 
 ```sh
-sudo pacman -S base-devel cmake pkgconf gtk4 libsoup3 json-glib sqlite gstreamer gst-plugins-base gst-plugins-good gst-plugins-ugly gst-libav
+sudo pacman -S base-devel cmake pkgconf gtk4 gtk4-layer-shell libsoup3 json-glib sqlite gstreamer gst-plugins-base gst-plugins-good gst-plugins-ugly gst-libav
 ```
 
 On Debian/Ubuntu:
 
 ```sh
-sudo apt install build-essential cmake pkg-config libgtk-4-dev libsoup-3.0-dev libjson-glib-dev libsqlite3-dev libgstreamer1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly gstreamer1.0-libav
+sudo apt install build-essential cmake pkg-config libgtk-4-dev libgtk4-layer-shell-dev libsoup-3.0-dev libjson-glib-dev libsqlite3-dev libgstreamer1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly gstreamer1.0-libav
 ```
 
 ## Build
@@ -70,6 +71,12 @@ Toggle an existing instance:
 ~/.local/bin/mini-dict --toggle
 ```
 
+Force a specific output:
+
+```sh
+~/.local/bin/mini-dict --toggle --monitor eDP-1
+```
+
 Clear cached lookup results:
 
 ```sh
@@ -84,8 +91,6 @@ Wayland applications generally cannot register arbitrary global shortcuts themse
 ~/.local/bin/mini-dict --toggle
 ```
 
-The command is single-instance aware: if the app is already running, it toggles the lookup window; otherwise it starts the app and shows the input window.
+The command is single-instance aware: if the app is already running, it toggles the lookup window; otherwise it starts the app and shows the input window. On KDE Wayland, Mini Dict asks KWin for the active output before showing the window. Other compositors can pass `--monitor OUTPUT` or set `MINI_DICT_MONITOR=OUTPUT`.
 
-When hiding a running window, Mini Dict requests window minimization first so the desktop can preserve the current window placement across the next toggle. If minimization is unavailable, it falls back to hiding the window.
-
-GTK4/Wayland also does not let normal applications force an exact screen position. The first window opens as a compact one-line input window and relies on the compositor for placement.
+Mini Dict uses gtk4-layer-shell on Wayland. The lookup window is horizontally centered on the selected output with its top edge placed at 25% of that output's height.

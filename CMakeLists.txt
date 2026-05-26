@@ -26,6 +26,7 @@ endif()
 
 pkg_check_modules(APP_DEPS REQUIRED IMPORTED_TARGET
   gtk4
+  gtk4-layer-shell-0
   libsoup-3.0
   json-glib-1.0
   sqlite3
