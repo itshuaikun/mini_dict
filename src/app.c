@@ -19,6 +19,7 @@ typedef struct {
   char *active_query_key;
   gboolean css_installed;
   gboolean displaying_cached_result;
+  gboolean hidden_by_shortcut;
 } AppState;
 
 static void app_present_input(AppState *state);
@@ -330,9 +331,28 @@ on_entry_activate(GtkEntry *entry, gpointer user_data)
 }
 
 static void
-hide_window(GtkWidget *window)
+hide_window(AppState *state)
 {
-  gtk_widget_set_visible(window, FALSE);
+  state->hidden_by_shortcut = TRUE;
+
+  GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(state->window));
+  if (surface && GDK_IS_TOPLEVEL(surface) &&
+      gdk_toplevel_minimize(GDK_TOPLEVEL(surface))) {
+    return;
+  }
+
+  gtk_widget_set_visible(state->window, FALSE);
+}
+
+static gboolean
+window_is_minimized(GtkWidget *window)
+{
+  GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(window));
+  if (!surface || !GDK_IS_TOPLEVEL(surface)) {
+    return FALSE;
+  }
+
+  return (gdk_toplevel_get_state(GDK_TOPLEVEL(surface)) & GDK_TOPLEVEL_STATE_MINIMIZED) != 0;
 }
 
 static gboolean
@@ -348,7 +368,7 @@ on_key_pressed(GtkEventControllerKey *controller,
   AppState *state = user_data;
 
   if (keyval == GDK_KEY_Escape) {
-    hide_window(state->window);
+    hide_window(state);
     return TRUE;
   }
   return FALSE;
@@ -375,7 +395,7 @@ ensure_window(AppState *state)
   gtk_window_set_child(GTK_WINDOW(state->window), root);
 
   state->entry = gtk_entry_new();
-  gtk_entry_set_placeholder_text(GTK_ENTRY(state->entry), "Look up a word or short phrase");
+  gtk_entry_set_placeholder_text(GTK_ENTRY(state->entry), "");
   gtk_widget_add_css_class(state->entry, "lookup-entry");
   gtk_box_append(GTK_BOX(root), state->entry);
   g_signal_connect(state->entry, "activate", G_CALLBACK(on_entry_activate), state);
@@ -411,6 +431,8 @@ static void
 app_present_input(AppState *state)
 {
   ensure_window(state);
+  state->hidden_by_shortcut = FALSE;
+  gtk_window_unminimize(GTK_WINDOW(state->window));
   gtk_window_present(GTK_WINDOW(state->window));
   gtk_widget_grab_focus(state->entry);
   gtk_editable_select_region(GTK_EDITABLE(state->entry), 0, -1);
@@ -420,8 +442,10 @@ static void
 app_toggle(AppState *state)
 {
   ensure_window(state);
-  if (gtk_widget_get_visible(state->window)) {
-    hide_window(state->window);
+  if (gtk_widget_get_visible(state->window) &&
+      !state->hidden_by_shortcut &&
+      !window_is_minimized(state->window)) {
+    hide_window(state);
     return;
   }
   app_present_input(state);

@@ -86,4 +86,6 @@ Wayland applications generally cannot register arbitrary global shortcuts themse
 
 The command is single-instance aware: if the app is already running, it toggles the lookup window; otherwise it starts the app and shows the input window.
 
+When hiding a running window, Mini Dict requests window minimization first so the desktop can preserve the current window placement across the next toggle. If minimization is unavailable, it falls back to hiding the window.
+
 GTK4/Wayland also does not let normal applications force an exact screen position. The first window opens as a compact one-line input window and relies on the compositor for placement.
