@@ -3,14 +3,23 @@
 #include "audio.h"
 #include "cache.h"
 #include "dictionary.h"
+#include "local_dictionary.h"
 
 #include <gtk4-layer-shell.h>
+#include <glib/gstdio.h>
+
+#include <errno.h>
+
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+#include <webkit/webkit.h>
+#endif
 
 #define CACHE_MAX_AGE_DAYS 30
-#define INPUT_WINDOW_WIDTH 560
-#define INPUT_WINDOW_HEIGHT 64
 #define RESULT_WINDOW_WIDTH 640
 #define RESULT_WINDOW_HEIGHT 520
+#define INPUT_WINDOW_WIDTH RESULT_WINDOW_WIDTH
+#define INPUT_WINDOW_HEIGHT 64
+#define SOUND_URI_PREFIX "sound://"
 
 typedef struct {
   GtkApplication *application;
@@ -18,19 +27,29 @@ typedef struct {
   GtkWidget *entry;
   GtkWidget *scrolled_window;
   GtkWidget *result_box;
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+  GtkWidget *web_view;
+#endif
   GtkWidget *status_label;
   LookupCache *cache;
+  LocalDictionaryReader *local_reader;
   AudioPlayer *audio_player;
   GCancellable *lookup_cancellable;
   char *active_query_key;
+  char *configured_dict_dir;
   char *requested_monitor_name;
   gboolean css_installed;
   gboolean displaying_cached_result;
   gboolean hidden_by_shortcut;
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+  gboolean pending_web_result;
+#endif
 } AppState;
 
 static gboolean app_present_input(AppState *state);
 static void ensure_css(AppState *state);
+static void perform_online_lookup(AppState *state, const char *query);
+static gboolean warm_local_reader_idle(gpointer user_data);
 
 static void
 clear_box(GtkWidget *box)
@@ -108,19 +127,36 @@ show_status(AppState *state, const char *message)
 }
 
 static void
-show_result_area(AppState *state)
+show_native_result_area(AppState *state)
 {
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+  if (state->web_view) {
+    gtk_widget_set_visible(state->web_view, FALSE);
+  }
+#endif
   gtk_widget_set_visible(state->scrolled_window, TRUE);
   gtk_window_set_default_size(GTK_WINDOW(state->window),
                               RESULT_WINDOW_WIDTH,
                               RESULT_WINDOW_HEIGHT);
 }
 
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+static void
+show_web_result_area(AppState *state)
+{
+  gtk_widget_set_visible(state->scrolled_window, FALSE);
+  gtk_widget_set_visible(state->web_view, TRUE);
+  gtk_window_set_default_size(GTK_WINDOW(state->window),
+                              RESULT_WINDOW_WIDTH,
+                              RESULT_WINDOW_HEIGHT);
+}
+#endif
+
 static void
 show_loading(AppState *state, const char *query)
 {
   state->displaying_cached_result = FALSE;
-  show_result_area(state);
+  show_native_result_area(state);
   clear_box(state->result_box);
   gtk_box_append(GTK_BOX(state->result_box), make_label("Looking up...", "muted"));
   if (query) {
@@ -133,7 +169,7 @@ static void
 show_error(AppState *state, const char *message)
 {
   state->displaying_cached_result = FALSE;
-  show_result_area(state);
+  show_native_result_area(state);
   clear_box(state->result_box);
   gtk_box_append(GTK_BOX(state->result_box), make_label(message, "error"));
 }
@@ -152,6 +188,107 @@ on_audio_button_clicked(GtkButton *button, gpointer user_data)
   const char *url = g_object_get_data(G_OBJECT(button), "audio-url");
   show_status(state, "");
   audio_player_play(state->audio_player, url, on_audio_error, state);
+}
+
+static const char *
+extension_from_key(const char *key)
+{
+  if (!key) {
+    return ".mp3";
+  }
+  const char *dot = strrchr(key, '.');
+  if (!dot || dot[1] == '\0' || strlen(dot) > 8) {
+    return ".mp3";
+  }
+  return dot;
+}
+
+static char *
+sound_uri_to_asset_key(const char *uri)
+{
+  const char *key = uri;
+  if (g_str_has_prefix(uri, SOUND_URI_PREFIX)) {
+    key = uri + strlen(SOUND_URI_PREFIX);
+  }
+
+  g_autofree char *unescaped = g_uri_unescape_string(key, NULL);
+  return g_strdup(unescaped && unescaped[0] ? unescaped : key);
+}
+
+static char *
+write_audio_asset_to_cache(const char *asset_key, GBytes *bytes, GError **error)
+{
+  g_autofree char *dir = g_build_filename(g_get_user_cache_dir(),
+                                          "mini-dict",
+                                          "ldoce-audio",
+                                          NULL);
+  if (g_mkdir_with_parents(dir, 0700) != 0) {
+    g_set_error(error,
+                G_FILE_ERROR,
+                g_file_error_from_errno(errno),
+                "Failed to create audio cache directory: %s",
+                dir);
+    return NULL;
+  }
+
+  g_autofree char *checksum =
+      g_compute_checksum_for_string(G_CHECKSUM_SHA256, asset_key, -1);
+  g_autofree char *filename =
+      g_strdup_printf("%s%s", checksum, extension_from_key(asset_key));
+  g_autofree char *path = g_build_filename(dir, filename, NULL);
+
+  gsize len = 0;
+  const char *data = g_bytes_get_data(bytes, &len);
+  if (!g_file_set_contents(path, data, len, error)) {
+    return NULL;
+  }
+
+  return g_steal_pointer(&path);
+}
+
+static gboolean
+play_local_dictionary_sound(AppState *state, const char *uri)
+{
+  if (!state->local_reader) {
+    show_status(state, "Local dictionary is not ready for pronunciation audio.");
+    return TRUE;
+  }
+
+  g_autofree char *asset_key = sound_uri_to_asset_key(uri);
+  GError *error = NULL;
+  g_autofree char *resolved_key = NULL;
+  GBytes *bytes =
+      local_dictionary_reader_load_asset(state->local_reader,
+                                         asset_key,
+                                         &resolved_key,
+                                         &error);
+  if (!bytes) {
+    show_status(state, error ? error->message : "Pronunciation audio is unavailable.");
+    g_clear_error(&error);
+    return TRUE;
+  }
+
+  g_autoptr(GBytes) owned_bytes = bytes;
+  g_autofree char *audio_path =
+      write_audio_asset_to_cache(resolved_key ? resolved_key : asset_key,
+                                 owned_bytes,
+                                 &error);
+  if (!audio_path) {
+    show_status(state, error ? error->message : "Pronunciation audio is unavailable.");
+    g_clear_error(&error);
+    return TRUE;
+  }
+
+  g_autofree char *audio_uri = g_filename_to_uri(audio_path, NULL, &error);
+  if (!audio_uri) {
+    show_status(state, error ? error->message : "Pronunciation audio is unavailable.");
+    g_clear_error(&error);
+    return TRUE;
+  }
+
+  show_status(state, "");
+  audio_player_play(state->audio_player, audio_uri, on_audio_error, state);
+  return TRUE;
 }
 
 static GtkWidget *
@@ -194,7 +331,7 @@ static void
 render_lookup_result(AppState *state, LookupResult *result, gboolean from_cache)
 {
   state->displaying_cached_result = from_cache;
-  show_result_area(state);
+  show_native_result_area(state);
   clear_box(state->result_box);
   show_status(state, from_cache ? "Showing cached result. Refreshing in the background..." : "");
 
@@ -236,6 +373,301 @@ render_lookup_result(AppState *state, LookupResult *result, gboolean from_cache)
 }
 
 static void
+on_online_fallback_clicked(GtkButton *button, gpointer user_data)
+{
+  AppState *state = user_data;
+  const char *query = g_object_get_data(G_OBJECT(button), "lookup-query");
+  if (query && query[0]) {
+    perform_online_lookup(state, query);
+  }
+}
+
+static GtkWidget *
+make_online_fallback_button(AppState *state, const char *query)
+{
+  GtkWidget *button = gtk_button_new_with_label("Try online lookup");
+  gtk_widget_set_halign(button, GTK_ALIGN_START);
+  g_object_set_data_full(G_OBJECT(button), "lookup-query", g_strdup(query), g_free);
+  g_signal_connect(button, "clicked", G_CALLBACK(on_online_fallback_clicked), state);
+  return button;
+}
+
+static void
+show_no_local_entry(AppState *state, const char *query)
+{
+  state->displaying_cached_result = FALSE;
+  show_native_result_area(state);
+  clear_box(state->result_box);
+  gtk_box_append(GTK_BOX(state->result_box), make_label("No local LDOCE entry found.", "muted"));
+  gtk_box_append(GTK_BOX(state->result_box), make_online_fallback_button(state, query));
+  show_status(state, "Local dictionary had no matching entry.");
+}
+
+static void
+show_local_dictionary_issue(AppState *state, const char *message)
+{
+  state->displaying_cached_result = FALSE;
+  show_native_result_area(state);
+  clear_box(state->result_box);
+  gtk_box_append(GTK_BOX(state->result_box),
+                 make_label(message && message[0] ? message : "Local dictionary is unavailable.",
+                            "error"));
+  show_status(state, "Configure LDOCE with --dict-dir or MINI_DICT_DICT_DIR.");
+}
+
+static void
+show_local_lookup_error(AppState *state, const char *message)
+{
+  state->displaying_cached_result = FALSE;
+  show_native_result_area(state);
+  clear_box(state->result_box);
+  gtk_box_append(GTK_BOX(state->result_box),
+                 make_label(message && message[0] ? message : "Local dictionary lookup failed.",
+                            "error"));
+  show_status(state, "Local dictionary lookup failed.");
+}
+
+static gboolean
+ensure_local_reader(AppState *state)
+{
+  if (state->local_reader) {
+    return TRUE;
+  }
+
+  g_autofree char *dict_dir = local_dictionary_resolve_dir(state->configured_dict_dir);
+  GError *error = NULL;
+  state->local_reader = local_dictionary_reader_new(dict_dir, &error);
+  if (!state->local_reader) {
+    show_local_dictionary_issue(state, error ? error->message : NULL);
+    g_clear_error(&error);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
+warm_local_reader_idle(gpointer user_data)
+{
+  AppState *state = user_data;
+  if (!state->window || state->local_reader) {
+    return G_SOURCE_REMOVE;
+  }
+
+  g_autofree char *dict_dir = local_dictionary_resolve_dir(state->configured_dict_dir);
+  GError *error = NULL;
+  state->local_reader = local_dictionary_reader_new(dict_dir, &error);
+  if (!state->local_reader) {
+    g_clear_error(&error);
+    return G_SOURCE_REMOVE;
+  }
+  if (!local_dictionary_reader_warm_up(state->local_reader, &error)) {
+    g_clear_error(&error);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+static char *
+build_local_dictionary_document(LocalDictionaryLookupResult *result)
+{
+  return g_strdup_printf(
+      "<!doctype html><html><head><meta charset=\"utf-8\">"
+      "<style>"
+      "html,body{margin:0;padding:0;background:#fff;color:#111;}"
+      ".pagetitle{border-top-style:double;}"
+      "</style>"
+      "</head><body>%s</body></html>",
+      result->entry_html ? result->entry_html : "");
+}
+
+static char *
+local_dictionary_base_uri(AppState *state)
+{
+  const char *dict_dir = local_dictionary_reader_get_dir(state->local_reader);
+  if (!dict_dir || dict_dir[0] == '\0') {
+    return g_strdup("about:blank");
+  }
+
+  g_autofree char *dir_with_separator =
+      g_str_has_suffix(dict_dir, G_DIR_SEPARATOR_S)
+          ? g_strdup(dict_dir)
+          : g_strconcat(dict_dir, G_DIR_SEPARATOR_S, NULL);
+  GError *error = NULL;
+  char *uri = g_filename_to_uri(dir_with_separator, NULL, &error);
+  if (!uri) {
+    g_warning("Failed to build local dictionary base URI: %s",
+              error ? error->message : "unknown error");
+    g_clear_error(&error);
+    return g_strdup("about:blank");
+  }
+  return uri;
+}
+
+static void
+render_local_dictionary_page(AppState *state, LocalDictionaryLookupResult *result)
+{
+  state->pending_web_result = TRUE;
+  show_status(state, "");
+  g_autofree char *document = build_local_dictionary_document(result);
+  g_autofree char *base_uri = local_dictionary_base_uri(state);
+  webkit_web_view_load_html(WEBKIT_WEB_VIEW(state->web_view), document, base_uri);
+}
+
+static void
+on_web_view_load_changed(WebKitWebView *web_view,
+                         WebKitLoadEvent load_event,
+                         gpointer user_data)
+{
+  (void)web_view;
+  AppState *state = user_data;
+  if (load_event != WEBKIT_LOAD_FINISHED || !state->pending_web_result) {
+    return;
+  }
+
+  state->pending_web_result = FALSE;
+  show_web_result_area(state);
+  show_status(state, "");
+  gtk_widget_grab_focus(state->entry);
+}
+
+static gboolean
+on_web_view_decide_policy(WebKitWebView *web_view,
+                          WebKitPolicyDecision *decision,
+                          WebKitPolicyDecisionType decision_type,
+                          gpointer user_data)
+{
+  (void)web_view;
+  AppState *state = user_data;
+  if (decision_type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION ||
+      !WEBKIT_IS_NAVIGATION_POLICY_DECISION(decision)) {
+    return FALSE;
+  }
+
+  WebKitNavigationAction *action =
+      webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+  WebKitURIRequest *request = action ? webkit_navigation_action_get_request(action) : NULL;
+  const char *uri = request ? webkit_uri_request_get_uri(request) : NULL;
+  if (uri && g_str_has_prefix(uri, SOUND_URI_PREFIX)) {
+    webkit_policy_decision_ignore(decision);
+    return play_local_dictionary_sound(state, uri);
+  }
+
+  return FALSE;
+}
+
+static void
+on_sound_script_message(WebKitUserContentManager *manager,
+                        JSCValue *value,
+                        gpointer user_data)
+{
+  (void)manager;
+  AppState *state = user_data;
+  if (!value) {
+    show_status(state, "Pronunciation audio is unavailable.");
+    return;
+  }
+
+  g_autofree char *uri = jsc_value_to_string(value);
+  if (!uri || uri[0] == '\0') {
+    show_status(state, "Pronunciation audio is unavailable.");
+    return;
+  }
+
+  play_local_dictionary_sound(state, uri);
+}
+
+static void
+install_ldoce_page_scripts(WebKitWebView *web_view, AppState *state)
+{
+  WebKitUserContentManager *manager =
+      webkit_web_view_get_user_content_manager(web_view);
+  g_signal_connect(manager,
+                   "script-message-received::miniDictSound",
+                   G_CALLBACK(on_sound_script_message),
+                   state);
+  webkit_user_content_manager_register_script_message_handler(manager,
+                                                              "miniDictSound",
+                                                              NULL);
+
+  const char *script_source =
+      "(function(){"
+      "function soundHrefFrom(target){"
+      "  var el = target && target.closest ? target.closest('a.speaker, a.PronCodes, .speaker, .PronCodes') : null;"
+      "  if (!el) return null;"
+      "  var href = el.getAttribute('href') || el.getAttribute('hrefalt');"
+      "  if (!href || href === '#') {"
+      "    var parent = el.closest ? (el.closest('.Head') || el.parentElement) : el.parentElement;"
+      "    var speaker = parent ? parent.querySelector('a.speaker[href]:not([href=\"#\"]), a.PronCodes[href]:not([href=\"#\"])') : null;"
+      "    href = speaker ? speaker.getAttribute('href') : href;"
+      "  }"
+      "  return href;"
+      "}"
+      "document.addEventListener('click', function(event){"
+      "  var href = soundHrefFrom(event.target);"
+      "  if (!href) return;"
+      "  if (href.indexOf('sound://') === 0 || href.indexOf('media/') >= 0 || href.indexOf('media\\\\') >= 0) {"
+      "    event.preventDefault();"
+      "    event.stopImmediatePropagation();"
+      "    window.webkit.messageHandlers.miniDictSound.postMessage(href);"
+      "  }"
+      "}, true);"
+      "})();";
+
+  WebKitUserScript *script =
+      webkit_user_script_new(script_source,
+                             WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                             WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END,
+                             NULL,
+                             NULL);
+  webkit_user_content_manager_add_script(manager, script);
+  webkit_user_script_unref(script);
+}
+#else
+static void
+render_local_dictionary_page(AppState *state, LocalDictionaryLookupResult *result)
+{
+  (void)result;
+  show_local_lookup_error(state,
+                          "Local dictionary HTML rendering requires webkitgtk-6.0, which was not found at build time.");
+}
+#endif
+
+static void
+perform_local_lookup(AppState *state, const char *query)
+{
+  if (!ensure_local_reader(state)) {
+    return;
+  }
+
+  LocalDictionaryLookupResult *local_result =
+      local_dictionary_reader_lookup(state->local_reader, query);
+  if (!local_result) {
+    show_local_lookup_error(state, "Local dictionary lookup failed.");
+    return;
+  }
+
+  switch (local_result->status) {
+  case LOCAL_DICTIONARY_LOOKUP_OK:
+    render_local_dictionary_page(state, local_result);
+    break;
+  case LOCAL_DICTIONARY_LOOKUP_NO_ENTRY:
+    show_no_local_entry(state, query);
+    break;
+  case LOCAL_DICTIONARY_LOOKUP_SETUP_ISSUE:
+    show_local_dictionary_issue(state, local_result->message);
+    break;
+  case LOCAL_DICTIONARY_LOOKUP_UNSUPPORTED:
+  case LOCAL_DICTIONARY_LOOKUP_ERROR:
+  default:
+    show_local_lookup_error(state, local_result->message);
+    break;
+  }
+
+  local_dictionary_lookup_result_free(local_result);
+}
+
+static void
 handle_network_result(DictionaryFetchResult *fetch_result,
                       const GError *error,
                       gpointer user_data)
@@ -270,6 +702,7 @@ handle_network_result(DictionaryFetchResult *fetch_result,
   }
 
   render_lookup_result(state, fetch_result->result, FALSE);
+  show_status(state, "Showing online fallback result.");
 }
 
 static void
@@ -287,16 +720,8 @@ start_network_lookup(AppState *state, const char *query)
 }
 
 static void
-perform_lookup(AppState *state, const char *input)
+perform_online_lookup(AppState *state, const char *query)
 {
-  g_autofree char *query = NULL;
-  g_autofree char *validation_message = NULL;
-  if (!validate_query(input, &query, &validation_message)) {
-    show_error(state, validation_message);
-    return;
-  }
-
-  gtk_editable_set_text(GTK_EDITABLE(state->entry), query);
   g_free(state->active_query_key);
   state->active_query_key = normalize_query(query);
   show_loading(state, query);
@@ -330,6 +755,23 @@ perform_lookup(AppState *state, const char *input)
     show_loading(state, query);
   }
   start_network_lookup(state, query);
+}
+
+static void
+perform_lookup(AppState *state, const char *input)
+{
+  g_autofree char *query = NULL;
+  g_autofree char *validation_message = NULL;
+  if (!validate_query(input, &query, &validation_message)) {
+    show_error(state, validation_message);
+    return;
+  }
+
+  gtk_editable_set_text(GTK_EDITABLE(state->entry), query);
+  g_free(state->active_query_key);
+  state->active_query_key = normalize_query(query);
+  show_status(state, "");
+  perform_local_lookup(state, query);
 }
 
 static void
@@ -572,9 +1014,32 @@ ensure_window(AppState *state)
   gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(state->scrolled_window),
                                 state->result_box);
 
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+  state->web_view = webkit_web_view_new();
+  GdkRGBA web_background = {1.0, 1.0, 1.0, 1.0};
+  webkit_web_view_set_background_color(WEBKIT_WEB_VIEW(state->web_view),
+                                       &web_background);
+  gtk_widget_set_vexpand(state->web_view, TRUE);
+  gtk_widget_set_visible(state->web_view, FALSE);
+  g_signal_connect(state->web_view,
+                   "load-changed",
+                   G_CALLBACK(on_web_view_load_changed),
+                   state);
+  g_signal_connect(state->web_view,
+                   "decide-policy",
+                   G_CALLBACK(on_web_view_decide_policy),
+                   state);
+  install_ldoce_page_scripts(WEBKIT_WEB_VIEW(state->web_view), state);
+  webkit_web_view_load_html(WEBKIT_WEB_VIEW(state->web_view),
+                            "<!doctype html><html><body style=\"margin:0;background:#fff\"></body></html>",
+                            "about:blank");
+  gtk_box_append(GTK_BOX(root), state->web_view);
+#endif
+
   GtkEventController *key_controller = gtk_event_controller_key_new();
   g_signal_connect(key_controller, "key-pressed", G_CALLBACK(on_key_pressed), state);
   gtk_widget_add_controller(state->window, key_controller);
+  g_idle_add(warm_local_reader_idle, state);
 
   return TRUE;
 }
@@ -684,6 +1149,70 @@ set_requested_monitor(AppState *state, const char *monitor_name)
 }
 
 static void
+set_configured_dict_dir(AppState *state, const char *dict_dir)
+{
+  if (!dict_dir || dict_dir[0] == '\0') {
+    return;
+  }
+  if (g_strcmp0(state->configured_dict_dir, dict_dir) == 0) {
+    return;
+  }
+
+  g_free(state->configured_dict_dir);
+  state->configured_dict_dir = g_strdup(dict_dir);
+  local_dictionary_reader_free(state->local_reader);
+  state->local_reader = NULL;
+}
+
+static int
+check_local_dictionary_command(AppState *state,
+                               GApplicationCommandLine *command_line,
+                               const char *query)
+{
+  if (!query || query[0] == '\0') {
+    g_application_command_line_printerr(command_line,
+                                        "Usage: mini-dict --check-dict WORD [--dict-dir DIR]\n");
+    return 1;
+  }
+
+  g_autofree char *dict_dir = local_dictionary_resolve_dir(state->configured_dict_dir);
+  GError *error = NULL;
+  LocalDictionaryReader *reader = local_dictionary_reader_new(dict_dir, &error);
+  if (!reader) {
+    g_application_command_line_printerr(command_line,
+                                        "Dictionary setup issue: %s\n",
+                                        error ? error->message : "unknown error");
+    g_clear_error(&error);
+    return 1;
+  }
+
+  LocalDictionaryLookupResult *result = local_dictionary_reader_lookup(reader, query);
+  int status = 1;
+  if (!result) {
+    g_application_command_line_printerr(command_line, "Local lookup failed.\n");
+  } else if (result->status == LOCAL_DICTIONARY_LOOKUP_OK) {
+    g_application_command_line_print(command_line,
+                                     "Local lookup OK: %s (%zu HTML bytes)\n",
+                                     result->query ? result->query : query,
+                                     result->entry_html ? strlen(result->entry_html) : 0);
+    status = 0;
+  } else if (result->status == LOCAL_DICTIONARY_LOOKUP_NO_ENTRY) {
+    g_application_command_line_print(command_line,
+                                     "No local entry: %s\n",
+                                     result->message ? result->message : query);
+    status = 2;
+  } else {
+    g_application_command_line_printerr(command_line,
+                                        "Local lookup failed: %s\n",
+                                        result->message ? result->message : "unknown error");
+  }
+
+  local_dictionary_lookup_result_free(result);
+  local_dictionary_reader_free(reader);
+  return status;
+}
+
+static void
 on_activate(GtkApplication *application, gpointer user_data)
 {
   (void)application;
@@ -700,6 +1229,14 @@ on_command_line(GApplication *application,
   int argc = 0;
   char **args = g_application_command_line_get_arguments(command_line, &argc);
   set_requested_monitor(state, arg_value(args, "--monitor"));
+  set_configured_dict_dir(state, arg_value(args, "--dict-dir"));
+
+  const char *check_query = arg_value(args, "--check-dict");
+  if (check_query) {
+    int status = check_local_dictionary_command(state, command_line, check_query);
+    g_strfreev(args);
+    return status;
+  }
 
   if (has_arg(args, "--clear-cache")) {
     GError *error = NULL;
@@ -744,8 +1281,10 @@ app_state_free(AppState *state)
     g_clear_object(&state->lookup_cancellable);
   }
   lookup_cache_free(state->cache);
+  local_dictionary_reader_free(state->local_reader);
   audio_player_free(state->audio_player);
   g_free(state->active_query_key);
+  g_free(state->configured_dict_dir);
   g_free(state->requested_monitor_name);
   g_free(state);
 }

@@ -1,0 +1,11 @@
+[package]
+name = "mini-dict-ldoce-reader"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mini_dict_ldoce_reader"
+crate-type = ["staticlib"]
+
+[dependencies]
+mdict-rs = { version = "0.1.4", features = ["lzo"] }

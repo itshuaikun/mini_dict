@@ -4,6 +4,7 @@
 
 struct _AudioPlayer {
   GstElement *playbin;
+  GstElement *warmup_pipeline;
   guint bus_watch_id;
   AudioErrorCallback error_callback;
   gpointer error_user_data;
@@ -37,11 +38,11 @@ audio_bus_callback(GstBus *bus, GstMessage *message, gpointer user_data)
     }
     g_clear_error(&error);
     g_free(debug);
-    gst_element_set_state(player->playbin, GST_STATE_NULL);
+    gst_element_set_state(player->playbin, GST_STATE_READY);
     break;
   }
   case GST_MESSAGE_EOS:
-    gst_element_set_state(player->playbin, GST_STATE_NULL);
+    gst_element_set_state(player->playbin, GST_STATE_READY);
     break;
   default:
     break;
@@ -55,6 +56,16 @@ audio_player_new(void)
 {
   AudioPlayer *player = g_new0(AudioPlayer, 1);
   player->playbin = gst_element_factory_make("playbin", "pronunciation-player");
+  GError *warmup_error = NULL;
+  player->warmup_pipeline =
+      gst_parse_launch("audiotestsrc is-live=true wave=silence volume=0 ! "
+                       "audioconvert ! audioresample ! autoaudiosink sync=false",
+                       &warmup_error);
+  if (player->warmup_pipeline) {
+    gst_element_set_state(player->warmup_pipeline, GST_STATE_PLAYING);
+  } else {
+    g_clear_error(&warmup_error);
+  }
   if (player->playbin) {
     GstBus *bus = gst_element_get_bus(player->playbin);
     player->bus_watch_id = gst_bus_add_watch(bus, audio_bus_callback, player);
@@ -76,6 +87,10 @@ audio_player_free(AudioPlayer *player)
     gst_element_set_state(player->playbin, GST_STATE_NULL);
     gst_object_unref(player->playbin);
   }
+  if (player->warmup_pipeline) {
+    gst_element_set_state(player->warmup_pipeline, GST_STATE_NULL);
+    gst_object_unref(player->warmup_pipeline);
+  }
   g_free(player);
 }
 
@@ -95,7 +110,24 @@ audio_player_play(AudioPlayer *player,
   player->error_callback = callback;
   player->error_user_data = user_data;
 
-  gst_element_set_state(player->playbin, GST_STATE_NULL);
+  gst_element_set_state(player->playbin, GST_STATE_READY);
   g_object_set(player->playbin, "uri", uri, NULL);
+
+  GstStateChangeReturn state_result =
+      gst_element_set_state(player->playbin, GST_STATE_PAUSED);
+  if (state_result == GST_STATE_CHANGE_ASYNC) {
+    state_result = gst_element_get_state(player->playbin,
+                                         NULL,
+                                         NULL,
+                                         250 * GST_MSECOND);
+  }
+  if (state_result == GST_STATE_CHANGE_FAILURE) {
+    gst_element_set_state(player->playbin, GST_STATE_READY);
+    if (callback) {
+      callback("Pronunciation audio could not be prepared for playback", user_data);
+    }
+    return;
+  }
+
   gst_element_set_state(player->playbin, GST_STATE_PLAYING);
 }

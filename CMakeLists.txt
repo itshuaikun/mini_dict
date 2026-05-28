@@ -13,6 +13,7 @@ endif()
 
 option(MINI_DICT_NATIVE_OPTIMIZE "Optimize the binary for this machine" ON)
 option(MINI_DICT_ENABLE_LTO "Enable link-time optimization for release builds" ON)
+option(MINI_DICT_REQUIRE_WEBKITGTK "Require WebKitGTK 6.0 for local dictionary HTML rendering" ON)
 
 find_package(PkgConfig REQUIRED)
 include(CheckIPOSupported)
@@ -33,9 +34,25 @@ pkg_check_modules(APP_DEPS REQUIRED IMPORTED_TARGET
   gstreamer-1.0
 )
 
+pkg_check_modules(WEBKITGTK QUIET IMPORTED_TARGET webkitgtk-6.0)
+find_program(CARGO_EXECUTABLE cargo)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(MINI_DICT_CARGO_PROFILE release)
+  set(MINI_DICT_CARGO_BUILD_ARGS --release)
+else()
+  set(MINI_DICT_CARGO_PROFILE debug)
+  set(MINI_DICT_CARGO_BUILD_ARGS)
+endif()
+
+set(MINI_DICT_LDOCE_READER_MANIFEST ${CMAKE_SOURCE_DIR}/rust/ldoce_reader/Cargo.toml)
+set(MINI_DICT_LDOCE_READER_LIB
+    ${CMAKE_BINARY_DIR}/cargo/${MINI_DICT_CARGO_PROFILE}/libmini_dict_ldoce_reader.a)
+
 function(mini_dict_configure_target target)
   target_include_directories(${target} PRIVATE src)
   target_link_libraries(${target} PRIVATE PkgConfig::APP_DEPS)
+  target_compile_definitions(${target} PRIVATE MINI_DICT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
   if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
@@ -58,8 +75,42 @@ add_executable(mini-dict
   src/audio.c
   src/cache.c
   src/dictionary.c
+  src/local_dictionary.c
 )
 mini_dict_configure_target(mini-dict)
+
+if(WEBKITGTK_FOUND)
+  target_compile_definitions(mini-dict PRIVATE MINI_DICT_HAVE_WEBKITGTK)
+  target_link_libraries(mini-dict PRIVATE PkgConfig::WEBKITGTK)
+elseif(MINI_DICT_REQUIRE_WEBKITGTK)
+  message(FATAL_ERROR "webkitgtk-6.0 was not found. Install WebKitGTK 6.0 or configure with -DMINI_DICT_REQUIRE_WEBKITGTK=OFF to build without embedded local dictionary rendering.")
+else()
+  message(WARNING "webkitgtk-6.0 was not found; local dictionary HTML rendering will be disabled")
+endif()
+
+if(CARGO_EXECUTABLE)
+  add_custom_command(
+    OUTPUT ${MINI_DICT_LDOCE_READER_LIB}
+    COMMAND ${CMAKE_COMMAND} -E env
+            CARGO_TARGET_DIR=${CMAKE_BINARY_DIR}/cargo
+            ${CARGO_EXECUTABLE} build
+            --manifest-path ${MINI_DICT_LDOCE_READER_MANIFEST}
+            ${MINI_DICT_CARGO_BUILD_ARGS}
+    DEPENDS
+      ${MINI_DICT_LDOCE_READER_MANIFEST}
+      ${CMAKE_SOURCE_DIR}/rust/ldoce_reader/src/lib.rs
+    VERBATIM
+  )
+  add_custom_target(mini-dict-ldoce-reader DEPENDS ${MINI_DICT_LDOCE_READER_LIB})
+
+  foreach(target mini-dict)
+    add_dependencies(${target} mini-dict-ldoce-reader)
+    target_compile_definitions(${target} PRIVATE MINI_DICT_HAVE_LDOCE_READER)
+    target_link_libraries(${target} PRIVATE ${MINI_DICT_LDOCE_READER_LIB} dl pthread m)
+  endforeach()
+else()
+  message(WARNING "cargo was not found; local MDX/MDD lookup will be disabled")
+endif()
 
 enable_testing()
 
@@ -70,5 +121,19 @@ add_executable(test-dictionary-parser
 mini_dict_configure_target(test-dictionary-parser)
 
 add_test(NAME dictionary-parser COMMAND test-dictionary-parser)
+
+add_executable(test-local-dictionary
+  tests/test_local_dictionary.c
+  src/local_dictionary.c
+)
+mini_dict_configure_target(test-local-dictionary)
+
+if(CARGO_EXECUTABLE)
+  add_dependencies(test-local-dictionary mini-dict-ldoce-reader)
+  target_compile_definitions(test-local-dictionary PRIVATE MINI_DICT_HAVE_LDOCE_READER)
+  target_link_libraries(test-local-dictionary PRIVATE ${MINI_DICT_LDOCE_READER_LIB} dl pthread m)
+endif()
+
+add_test(NAME local-dictionary COMMAND test-local-dictionary)
 
 install(TARGETS mini-dict RUNTIME DESTINATION bin)
