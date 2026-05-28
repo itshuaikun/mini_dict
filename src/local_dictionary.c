@@ -179,6 +179,52 @@ local_dictionary_reader_get_dir(LocalDictionaryReader *reader)
 }
 
 gboolean
+local_dictionary_reader_get_source_identity(LocalDictionaryReader *reader,
+                                            char **mdx_path,
+                                            gint64 *mdx_size,
+                                            gint64 *mdx_mtime,
+                                            GError **error)
+{
+  if (mdx_path) {
+    *mdx_path = NULL;
+  }
+  if (mdx_size) {
+    *mdx_size = 0;
+  }
+  if (mdx_mtime) {
+    *mdx_mtime = 0;
+  }
+  if (!reader || !reader->mdx_path) {
+    g_set_error(error,
+                local_dictionary_error_quark(),
+                4,
+                "Local dictionary is not configured.");
+    return FALSE;
+  }
+
+  GStatBuf stat_buf;
+  if (g_stat(reader->mdx_path, &stat_buf) != 0) {
+    g_set_error(error,
+                local_dictionary_error_quark(),
+                11,
+                "Failed to stat local dictionary source: %s",
+                reader->mdx_path);
+    return FALSE;
+  }
+
+  if (mdx_path) {
+    *mdx_path = g_strdup(reader->mdx_path);
+  }
+  if (mdx_size) {
+    *mdx_size = (gint64)stat_buf.st_size;
+  }
+  if (mdx_mtime) {
+    *mdx_mtime = (gint64)stat_buf.st_mtime;
+  }
+  return TRUE;
+}
+
+gboolean
 local_dictionary_reader_warm_up(LocalDictionaryReader *reader, GError **error)
 {
   if (!reader) {
@@ -285,6 +331,56 @@ local_dictionary_reader_lookup(LocalDictionaryReader *reader,
       LOCAL_DICTIONARY_LOOKUP_UNSUPPORTED,
       query,
       "Local LDOCE directory is configured, but MDX/MDD entry lookup is not implemented yet.");
+#endif
+}
+
+gboolean
+local_dictionary_reader_iter_entries(LocalDictionaryReader *reader,
+                                     LocalDictionaryEntryCallback callback,
+                                     gpointer user_data,
+                                     GError **error)
+{
+  if (!reader) {
+    g_set_error(error,
+                local_dictionary_error_quark(),
+                4,
+                "Local dictionary is not configured.");
+    return FALSE;
+  }
+  if (!callback) {
+    g_set_error(error,
+                local_dictionary_error_quark(),
+                12,
+                "Local dictionary entry callback is not configured.");
+    return FALSE;
+  }
+
+#ifdef MINI_DICT_HAVE_LDOCE_READER
+  if (!reader->reader && !local_dictionary_reader_warm_up(reader, error)) {
+    return FALSE;
+  }
+
+  char *error_message = NULL;
+  int status = mini_dict_ldoce_reader_iter_entries(reader->reader,
+                                                   callback,
+                                                   user_data,
+                                                   &error_message);
+  if (status != 0) {
+    g_set_error(error,
+                local_dictionary_error_quark(),
+                13,
+                "%s",
+                error_message ? error_message : "Failed to iterate local dictionary entries.");
+    mini_dict_ldoce_string_free(error_message);
+    return FALSE;
+  }
+  return TRUE;
+#else
+  g_set_error(error,
+              local_dictionary_error_quark(),
+              14,
+              "Local dictionary entry iteration is not available in this build");
+  return FALSE;
 #endif
 }
 

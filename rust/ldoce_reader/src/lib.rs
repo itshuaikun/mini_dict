@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 
 use mdict_rs::{MddFile, MdxFile};
@@ -30,6 +30,9 @@ pub struct Reader {
     mdx: MdxFile,
     mdd: MddFile,
 }
+
+type EntryCallback =
+    unsafe extern "C" fn(key: *const c_char, html: *const c_char, user_data: *mut c_void) -> c_int;
 
 fn cstr_to_string(value: *const c_char) -> Result<String, String> {
     if value.is_null() {
@@ -77,7 +80,10 @@ fn link_target(text: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn lookup_following_links(reader: &Reader, query: &str) -> Result<Option<(String, String)>, String> {
+fn lookup_following_links(
+    reader: &Reader,
+    query: &str,
+) -> Result<Option<(String, String)>, String> {
     let mut current = query.to_string();
     for _ in 0..MAX_LINK_DEPTH {
         let Some(record) = reader
@@ -246,6 +252,46 @@ pub extern "C" fn mini_dict_ldoce_reader_lookup(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn mini_dict_ldoce_reader_iter_entries(
+    reader: *mut Reader,
+    callback: Option<EntryCallback>,
+    user_data: *mut c_void,
+    error_out: *mut *mut c_char,
+) -> c_int {
+    if reader.is_null() {
+        unsafe { set_error(error_out, "local dictionary reader is not open") };
+        return STATUS_ERROR;
+    }
+
+    let Some(callback) = callback else {
+        unsafe { set_error(error_out, "entry callback is null") };
+        return STATUS_ERROR;
+    };
+
+    let reader = unsafe { &*reader };
+    for entry in reader.mdx.entries() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                unsafe { set_error(error_out, error.to_string()) };
+                return STATUS_ERROR;
+            }
+        };
+
+        let key = into_c_string(&entry.key);
+        let html = into_c_string(&entry.text);
+        let should_stop = unsafe { callback(key, html, user_data) != 0 };
+        let _ = unsafe { CString::from_raw(key) };
+        let _ = unsafe { CString::from_raw(html) };
+        if should_stop {
+            return STATUS_ERROR;
+        }
+    }
+
+    STATUS_OK
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn mini_dict_ldoce_lookup_status(result: *const MiniDictLdoceLookup) -> c_int {
     if result.is_null() {
         return STATUS_ERROR;
@@ -254,9 +300,7 @@ pub extern "C" fn mini_dict_ldoce_lookup_status(result: *const MiniDictLdoceLook
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn mini_dict_ldoce_lookup_key(
-    result: *const MiniDictLdoceLookup,
-) -> *const c_char {
+pub extern "C" fn mini_dict_ldoce_lookup_key(result: *const MiniDictLdoceLookup) -> *const c_char {
     if result.is_null() {
         return std::ptr::null();
     }
@@ -264,9 +308,7 @@ pub extern "C" fn mini_dict_ldoce_lookup_key(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn mini_dict_ldoce_lookup_html(
-    result: *const MiniDictLdoceLookup,
-) -> *const c_char {
+pub extern "C" fn mini_dict_ldoce_lookup_html(result: *const MiniDictLdoceLookup) -> *const c_char {
     if result.is_null() {
         return std::ptr::null();
     }
@@ -309,9 +351,7 @@ pub extern "C" fn mini_dict_ldoce_asset_status(result: *const MiniDictLdoceAsset
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn mini_dict_ldoce_asset_key(
-    result: *const MiniDictLdoceAsset,
-) -> *const c_char {
+pub extern "C" fn mini_dict_ldoce_asset_key(result: *const MiniDictLdoceAsset) -> *const c_char {
     if result.is_null() {
         return std::ptr::null();
     }
@@ -319,9 +359,7 @@ pub extern "C" fn mini_dict_ldoce_asset_key(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn mini_dict_ldoce_asset_data(
-    result: *const MiniDictLdoceAsset,
-) -> *const u8 {
+pub extern "C" fn mini_dict_ldoce_asset_data(result: *const MiniDictLdoceAsset) -> *const u8 {
     if result.is_null() {
         return std::ptr::null();
     }

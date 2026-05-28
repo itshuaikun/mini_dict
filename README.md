@@ -9,6 +9,7 @@ A small GTK4 dictionary lookup window for Linux Wayland desktops.
 - Full scrollable LDOCE 5++ V2.15 dictionary result after pressing Enter
 - British and American phonetic text when available
 - Chinese meanings from the local LDOCE dictionary source
+- Chinese-to-English reverse lookup through a local candidate list
 - Pronunciation audio playback when the dictionary source provides audio
 - Explicit online lookup fallback using the current online dictionary API
 - SQLite cache for successful online fallback results
@@ -56,12 +57,6 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMINI_DICT_NATIVE_OPTIMIZE=ON -D
 cmake --build build
 ```
 
-By default, configuration fails if WebKitGTK 6.0 is unavailable because embedded LDOCE page rendering depends on it. For reader-only development without embedded rendering:
-
-```sh
-cmake -S . -B build -DMINI_DICT_REQUIRE_WEBKITGTK=OFF
-```
-
 Run:
 
 ```sh
@@ -86,6 +81,12 @@ Check that the local LDOCE reader can resolve an entry without opening the UI:
 
 ```sh
 ./build/mini-dict --dict-dir "/path/to/LDOCE 5++ V2.15" --check-dict apple
+```
+
+Rebuild the local Chinese reverse lookup index:
+
+```sh
+./build/mini-dict --dict-dir "/path/to/LDOCE 5++ V2.15" --rebuild-chinese-index
 ```
 
 Install for the current user:

@@ -6,6 +6,9 @@
 typedef struct MiniDictLdoceReader MiniDictLdoceReader;
 typedef struct MiniDictLdoceLookup MiniDictLdoceLookup;
 typedef struct MiniDictLdoceAsset MiniDictLdoceAsset;
+typedef int (*MiniDictLdoceEntryCallback)(const char *key,
+                                          const char *html,
+                                          void *user_data);
 
 MiniDictLdoceReader *mini_dict_ldoce_reader_open(const char *mdx_path,
                                                  const char *mdd_path,
@@ -14,6 +17,10 @@ void mini_dict_ldoce_reader_free(MiniDictLdoceReader *reader);
 
 MiniDictLdoceLookup *mini_dict_ldoce_reader_lookup(MiniDictLdoceReader *reader,
                                                    const char *query);
+int mini_dict_ldoce_reader_iter_entries(MiniDictLdoceReader *reader,
+                                        MiniDictLdoceEntryCallback callback,
+                                        void *user_data,
+                                        char **error_out);
 int mini_dict_ldoce_lookup_status(const MiniDictLdoceLookup *result);
 const char *mini_dict_ldoce_lookup_key(const MiniDictLdoceLookup *result);
 const char *mini_dict_ldoce_lookup_html(const MiniDictLdoceLookup *result);

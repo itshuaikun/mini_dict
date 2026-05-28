@@ -2,6 +2,7 @@
 
 #include "audio.h"
 #include "cache.h"
+#include "chinese_index.h"
 #include "dictionary.h"
 #include "local_dictionary.h"
 
@@ -32,15 +33,22 @@ typedef struct {
 #endif
   GtkWidget *status_label;
   LookupCache *cache;
+  ChineseIndex *chinese_index;
   LocalDictionaryReader *local_reader;
   AudioPlayer *audio_player;
   GCancellable *lookup_cancellable;
+  GPtrArray *active_chinese_candidates;
   char *active_query_key;
+  char *active_chinese_candidate_query;
+  char *pending_chinese_query;
   char *configured_dict_dir;
   char *requested_monitor_name;
   gboolean css_installed;
   gboolean displaying_cached_result;
   gboolean hidden_by_shortcut;
+  gboolean chinese_index_building;
+  gboolean chinese_candidate_navigated;
+  int selected_chinese_candidate;
 #ifdef MINI_DICT_HAVE_WEBKITGTK
   gboolean pending_web_result;
 #endif
@@ -49,7 +57,22 @@ typedef struct {
 static gboolean app_present_input(AppState *state);
 static void ensure_css(AppState *state);
 static void perform_online_lookup(AppState *state, const char *query);
+static void perform_local_lookup(AppState *state, const char *query);
+static void perform_chinese_lookup(AppState *state, const char *query);
 static gboolean warm_local_reader_idle(gpointer user_data);
+
+static void
+clear_chinese_candidate_state(AppState *state)
+{
+  if (state->active_chinese_candidates) {
+    g_ptr_array_unref(state->active_chinese_candidates);
+    state->active_chinese_candidates = NULL;
+  }
+  g_free(state->active_chinese_candidate_query);
+  state->active_chinese_candidate_query = NULL;
+  state->chinese_candidate_navigated = FALSE;
+  state->selected_chinese_candidate = -1;
+}
 
 static void
 clear_box(GtkWidget *box)
@@ -69,9 +92,18 @@ make_label(const char *text, const char *css_class)
   gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
   gtk_label_set_wrap(GTK_LABEL(label), TRUE);
   gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+  gtk_widget_set_focusable(label, FALSE);
   if (css_class) {
     gtk_widget_add_css_class(label, css_class);
   }
+  return label;
+}
+
+static GtkWidget *
+make_display_label(const char *text, const char *css_class)
+{
+  GtkWidget *label = make_label(text, css_class);
+  gtk_label_set_selectable(GTK_LABEL(label), FALSE);
   return label;
 }
 
@@ -155,6 +187,7 @@ show_web_result_area(AppState *state)
 static void
 show_loading(AppState *state, const char *query)
 {
+  clear_chinese_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -168,6 +201,7 @@ show_loading(AppState *state, const char *query)
 static void
 show_error(AppState *state, const char *message)
 {
+  clear_chinese_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -300,6 +334,7 @@ make_audio_button(AppState *state, const char *url, const char *tooltip)
 
   GtkWidget *button = gtk_button_new_from_icon_name("audio-volume-high-symbolic");
   gtk_widget_add_css_class(button, "flat");
+  gtk_widget_set_focusable(button, FALSE);
   gtk_widget_set_tooltip_text(button, tooltip);
   g_object_set_data_full(G_OBJECT(button), "audio-url", g_strdup(url), g_free);
   g_signal_connect(button, "clicked", G_CALLBACK(on_audio_button_clicked), state);
@@ -330,6 +365,7 @@ append_phonetic(GtkWidget *row,
 static void
 render_lookup_result(AppState *state, LookupResult *result, gboolean from_cache)
 {
+  clear_chinese_candidate_state(state);
   state->displaying_cached_result = from_cache;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -387,6 +423,7 @@ make_online_fallback_button(AppState *state, const char *query)
 {
   GtkWidget *button = gtk_button_new_with_label("Try online lookup");
   gtk_widget_set_halign(button, GTK_ALIGN_START);
+  gtk_widget_set_focusable(button, FALSE);
   g_object_set_data_full(G_OBJECT(button), "lookup-query", g_strdup(query), g_free);
   g_signal_connect(button, "clicked", G_CALLBACK(on_online_fallback_clicked), state);
   return button;
@@ -395,6 +432,7 @@ make_online_fallback_button(AppState *state, const char *query)
 static void
 show_no_local_entry(AppState *state, const char *query)
 {
+  clear_chinese_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -406,6 +444,7 @@ show_no_local_entry(AppState *state, const char *query)
 static void
 show_local_dictionary_issue(AppState *state, const char *message)
 {
+  clear_chinese_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -418,6 +457,7 @@ show_local_dictionary_issue(AppState *state, const char *message)
 static void
 show_local_lookup_error(AppState *state, const char *message)
 {
+  clear_chinese_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -425,6 +465,322 @@ show_local_lookup_error(AppState *state, const char *message)
                  make_label(message && message[0] ? message : "Local dictionary lookup failed.",
                             "error"));
   show_status(state, "Local dictionary lookup failed.");
+}
+
+static gboolean
+is_han_char(gunichar c)
+{
+  return (c >= 0x3400 && c <= 0x4DBF) ||
+         (c >= 0x4E00 && c <= 0x9FFF) ||
+         (c >= 0xF900 && c <= 0xFAFF) ||
+         (c >= 0x20000 && c <= 0x2A6DF) ||
+         (c >= 0x2A700 && c <= 0x2B73F) ||
+         (c >= 0x2B740 && c <= 0x2B81F) ||
+         (c >= 0x2B820 && c <= 0x2CEAF);
+}
+
+static gboolean
+is_chinese_query(const char *query, guint *char_count)
+{
+  guint count = 0;
+  for (const char *p = query; p && *p; p = g_utf8_next_char(p)) {
+    gunichar c = g_utf8_get_char_validated(p, -1);
+    if (c == (gunichar)-1 || c == (gunichar)-2 || !is_han_char(c)) {
+      return FALSE;
+    }
+    count++;
+  }
+  if (char_count) {
+    *char_count = count;
+  }
+  return count > 0;
+}
+
+static gboolean
+contains_han(const char *query)
+{
+  for (const char *p = query; p && *p; p = g_utf8_next_char(p)) {
+    gunichar c = g_utf8_get_char_validated(p, -1);
+    if (c == (gunichar)-1 || c == (gunichar)-2) {
+      return FALSE;
+    }
+    if (is_han_char(c)) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+static gboolean
+ensure_chinese_index(AppState *state)
+{
+  if (state->chinese_index) {
+    return TRUE;
+  }
+
+  GError *error = NULL;
+  state->chinese_index = chinese_index_new(&error);
+  if (!state->chinese_index) {
+    show_local_lookup_error(state,
+                            error ? error->message : "Chinese reverse lookup is unavailable.");
+    g_clear_error(&error);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static void
+update_chinese_candidate_selection(AppState *state)
+{
+  GtkWidget *selected_child = NULL;
+  GtkWidget *child = gtk_widget_get_first_child(state->result_box);
+  while (child) {
+    gpointer stored_index = g_object_get_data(G_OBJECT(child), "candidate-index");
+    if (stored_index) {
+      int index = GPOINTER_TO_INT(stored_index) - 1;
+      if (index == state->selected_chinese_candidate) {
+        gtk_widget_add_css_class(child, "selected");
+        selected_child = child;
+      } else {
+        gtk_widget_remove_css_class(child, "selected");
+      }
+    }
+    child = gtk_widget_get_next_sibling(child);
+  }
+
+  if (!selected_child || !state->scrolled_window) {
+    return;
+  }
+
+  graphene_point_t origin = GRAPHENE_POINT_INIT(0.0f, 0.0f);
+  graphene_point_t translated = GRAPHENE_POINT_INIT(0.0f, 0.0f);
+  if (!gtk_widget_compute_point(selected_child,
+                                state->result_box,
+                                &origin,
+                                &translated)) {
+    return;
+  }
+
+  GtkAdjustment *adjustment =
+      gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(state->scrolled_window));
+  double value = gtk_adjustment_get_value(adjustment);
+  double page_size = gtk_adjustment_get_page_size(adjustment);
+  double lower = gtk_adjustment_get_lower(adjustment);
+  double upper = gtk_adjustment_get_upper(adjustment);
+  double max = upper - page_size;
+  if (max < lower) {
+    max = lower;
+  }
+
+  double child_top = translated.y;
+  double child_bottom = child_top + gtk_widget_get_height(selected_child);
+  if (child_top < value) {
+    gtk_adjustment_set_value(adjustment, CLAMP(child_top, lower, max));
+  } else if (child_bottom > value + page_size) {
+    gtk_adjustment_set_value(adjustment,
+                             CLAMP(child_bottom - page_size, lower, max));
+  }
+}
+
+static gboolean
+chinese_candidate_query_is_current(AppState *state)
+{
+  if (!state->active_chinese_candidates ||
+      state->active_chinese_candidates->len == 0 ||
+      !state->active_chinese_candidate_query) {
+    return FALSE;
+  }
+
+  const char *entry_text = gtk_editable_get_text(GTK_EDITABLE(state->entry));
+  return g_strcmp0(entry_text, state->active_chinese_candidate_query) == 0;
+}
+
+static void
+open_selected_chinese_candidate(AppState *state)
+{
+  if (!state->active_chinese_candidates ||
+      state->selected_chinese_candidate < 0 ||
+      (guint)state->selected_chinese_candidate >= state->active_chinese_candidates->len) {
+    return;
+  }
+
+  ChineseIndexCandidate *candidate =
+      g_ptr_array_index(state->active_chinese_candidates,
+                        (guint)state->selected_chinese_candidate);
+  if (!candidate || !candidate->entry_key) {
+    return;
+  }
+
+  g_autofree char *entry_key = g_strdup(candidate->entry_key);
+  gtk_editable_set_text(GTK_EDITABLE(state->entry), entry_key);
+  g_free(state->active_query_key);
+  state->active_query_key = normalize_query(entry_key);
+  perform_local_lookup(state, entry_key);
+}
+
+static void
+on_chinese_candidate_clicked(GtkButton *button, gpointer user_data)
+{
+  AppState *state = user_data;
+  state->selected_chinese_candidate =
+      GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "candidate-index")) - 1;
+  open_selected_chinese_candidate(state);
+}
+
+static GtkWidget *
+make_chinese_candidate_button(AppState *state,
+                              ChineseIndexCandidate *candidate,
+                              guint index)
+{
+  GtkWidget *button = gtk_button_new();
+  gtk_widget_add_css_class(button, "candidate-row");
+  gtk_widget_set_halign(button, GTK_ALIGN_FILL);
+  gtk_widget_set_focusable(button, FALSE);
+  g_object_set_data(G_OBJECT(button), "candidate-index", GINT_TO_POINTER((int)index + 1));
+  g_signal_connect(button, "clicked", G_CALLBACK(on_chinese_candidate_clicked), state);
+
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+  gtk_widget_set_halign(box, GTK_ALIGN_FILL);
+  GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+  gtk_box_append(GTK_BOX(header), make_display_label(candidate->entry_key, "candidate-word"));
+  if (candidate->part_of_speech && candidate->part_of_speech[0]) {
+    gtk_box_append(GTK_BOX(header),
+                   make_display_label(candidate->part_of_speech, "candidate-pos"));
+  }
+  gtk_box_append(GTK_BOX(box), header);
+  gtk_box_append(GTK_BOX(box), make_display_label(candidate->snippet, "candidate-snippet"));
+
+  gtk_button_set_child(GTK_BUTTON(button), box);
+  return button;
+}
+
+static void
+render_chinese_candidates(AppState *state, const char *query, GPtrArray *candidates)
+{
+  clear_chinese_candidate_state(state);
+  state->displaying_cached_result = FALSE;
+  show_native_result_area(state);
+  clear_box(state->result_box);
+  show_status(state, "");
+
+  if (!candidates || candidates->len == 0) {
+    if (candidates) {
+      g_ptr_array_unref(candidates);
+    }
+    g_autofree char *message =
+        g_strdup_printf("No English entries found for \"%s\".", query);
+    gtk_box_append(GTK_BOX(state->result_box), make_label(message, "muted"));
+    return;
+  }
+
+  state->active_chinese_candidates = candidates;
+  state->active_chinese_candidate_query = g_strdup(query);
+  state->chinese_candidate_navigated = FALSE;
+  state->selected_chinese_candidate = 0;
+
+  for (guint i = 0; i < candidates->len; i++) {
+    ChineseIndexCandidate *candidate = g_ptr_array_index(candidates, i);
+    gtk_box_append(GTK_BOX(state->result_box),
+                   make_chinese_candidate_button(state, candidate, i));
+  }
+  update_chinese_candidate_selection(state);
+  gtk_widget_grab_focus(state->entry);
+}
+
+typedef struct {
+  ChineseIndex *index;
+  char *dict_dir;
+  char *query;
+} ChineseIndexBuildTask;
+
+static void
+chinese_index_build_task_free(ChineseIndexBuildTask *task)
+{
+  if (!task) {
+    return;
+  }
+  g_free(task->dict_dir);
+  g_free(task->query);
+  g_free(task);
+}
+
+static void
+build_chinese_index_thread(GTask *task,
+                           gpointer source_object,
+                           gpointer task_data,
+                           GCancellable *cancellable)
+{
+  (void)source_object;
+  (void)cancellable;
+  ChineseIndexBuildTask *build_task = task_data;
+  GError *error = NULL;
+  if (!chinese_index_rebuild(build_task->index, build_task->dict_dir, &error)) {
+    g_task_return_error(task, error);
+    return;
+  }
+  g_task_return_boolean(task, TRUE);
+}
+
+static void
+on_chinese_index_built(GObject *source_object,
+                       GAsyncResult *result,
+                       gpointer user_data)
+{
+  (void)source_object;
+  AppState *state = user_data;
+  state->chinese_index_building = FALSE;
+
+  GError *error = NULL;
+  if (!g_task_propagate_boolean(G_TASK(result), &error)) {
+    show_local_lookup_error(state,
+                            error ? error->message : "Chinese reverse lookup is unavailable.");
+    g_clear_error(&error);
+    g_application_release(G_APPLICATION(state->application));
+    return;
+  }
+
+  if (!state->pending_chinese_query) {
+    g_application_release(G_APPLICATION(state->application));
+    return;
+  }
+
+  g_autofree char *expected_key = g_strdup_printf("zh:%s", state->pending_chinese_query);
+  if (g_strcmp0(state->active_query_key, expected_key) == 0) {
+    perform_chinese_lookup(state, state->pending_chinese_query);
+  }
+  g_application_release(G_APPLICATION(state->application));
+}
+
+static void
+start_chinese_index_build(AppState *state, const char *query)
+{
+  if (state->chinese_index_building) {
+    g_free(state->pending_chinese_query);
+    state->pending_chinese_query = g_strdup(query);
+    show_status(state, "Building Chinese index...");
+    return;
+  }
+
+  g_autofree char *dict_dir = local_dictionary_resolve_dir(state->configured_dict_dir);
+  ChineseIndexBuildTask *build_task = g_new0(ChineseIndexBuildTask, 1);
+  build_task->index = state->chinese_index;
+  build_task->dict_dir = g_strdup(dict_dir);
+  build_task->query = g_strdup(query);
+
+  g_free(state->pending_chinese_query);
+  state->pending_chinese_query = g_strdup(query);
+  state->chinese_index_building = TRUE;
+  show_loading(state, query);
+  show_status(state, "Building Chinese index...");
+
+  GTask *task = g_task_new(NULL, NULL, on_chinese_index_built, state);
+  g_task_set_task_data(task,
+                       build_task,
+                       (GDestroyNotify)chinese_index_build_task_free);
+  g_application_hold(G_APPLICATION(state->application));
+  g_task_run_in_thread(task, build_chinese_index_thread);
+  g_object_unref(task);
 }
 
 static gboolean
@@ -507,6 +863,7 @@ local_dictionary_base_uri(AppState *state)
 static void
 render_local_dictionary_page(AppState *state, LocalDictionaryLookupResult *result)
 {
+  clear_chinese_candidate_state(state);
   state->pending_web_result = TRUE;
   show_status(state, "");
   g_autofree char *document = build_local_dictionary_document(result);
@@ -529,6 +886,27 @@ on_web_view_load_changed(WebKitWebView *web_view,
   show_web_result_area(state);
   show_status(state, "");
   gtk_widget_grab_focus(state->entry);
+}
+
+static gboolean
+scroll_web_result(AppState *state, int direction)
+{
+  if (!state->web_view || !gtk_widget_get_visible(state->web_view)) {
+    return FALSE;
+  }
+
+  const char *script = direction > 0
+      ? "window.scrollBy({top: 72, left: 0, behavior: 'auto'});"
+      : "window.scrollBy({top: -72, left: 0, behavior: 'auto'});";
+  webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(state->web_view),
+                                      script,
+                                      -1,
+                                      NULL,
+                                      NULL,
+                                      NULL,
+                                      NULL,
+                                      NULL);
+  return TRUE;
 }
 
 static gboolean
@@ -668,6 +1046,46 @@ perform_local_lookup(AppState *state, const char *query)
 }
 
 static void
+perform_chinese_lookup(AppState *state, const char *query)
+{
+  if (!ensure_local_reader(state) || !ensure_chinese_index(state)) {
+    return;
+  }
+
+  g_free(state->active_query_key);
+  state->active_query_key = g_strdup_printf("zh:%s", query);
+
+  gboolean ready = FALSE;
+  GError *error = NULL;
+  if (!chinese_index_is_ready(state->chinese_index,
+                              state->local_reader,
+                              &ready,
+                              &error)) {
+    show_local_lookup_error(state,
+                            error ? error->message : "Chinese reverse lookup is unavailable.");
+    g_clear_error(&error);
+    return;
+  }
+
+  if (!ready) {
+    start_chinese_index_build(state, query);
+    return;
+  }
+
+  GPtrArray *candidates = chinese_index_query(state->chinese_index,
+                                             query,
+                                             15,
+                                             &error);
+  if (!candidates) {
+    show_local_lookup_error(state,
+                            error ? error->message : "Chinese reverse lookup is unavailable.");
+    g_clear_error(&error);
+    return;
+  }
+  render_chinese_candidates(state, query, candidates);
+}
+
+static void
 handle_network_result(DictionaryFetchResult *fetch_result,
                       const GError *error,
                       gpointer user_data)
@@ -760,9 +1178,29 @@ perform_online_lookup(AppState *state, const char *query)
 static void
 perform_lookup(AppState *state, const char *input)
 {
+  g_autofree char *copy = g_strdup(input ? input : "");
+  g_strstrip(copy);
+
+  guint chinese_count = 0;
+  if (is_chinese_query(copy, &chinese_count)) {
+    if (chinese_count > 8) {
+      show_error(state, "Chinese lookup supports 1 to 8 Han characters.");
+      return;
+    }
+    gtk_editable_set_text(GTK_EDITABLE(state->entry), copy);
+    show_status(state, "");
+    perform_chinese_lookup(state, copy);
+    return;
+  }
+
+  if (contains_han(copy)) {
+    show_error(state, "Please enter either 1 to 8 Chinese characters or an English word.");
+    return;
+  }
+
   g_autofree char *query = NULL;
   g_autofree char *validation_message = NULL;
-  if (!validate_query(input, &query, &validation_message)) {
+  if (!validate_query(copy, &query, &validation_message)) {
     show_error(state, validation_message);
     return;
   }
@@ -778,7 +1216,19 @@ static void
 on_entry_activate(GtkEntry *entry, gpointer user_data)
 {
   AppState *state = user_data;
+  if (chinese_candidate_query_is_current(state)) {
+    open_selected_chinese_candidate(state);
+    return;
+  }
   perform_lookup(state, gtk_editable_get_text(GTK_EDITABLE(entry)));
+}
+
+static void
+on_entry_changed(GtkEditable *editable, gpointer user_data)
+{
+  (void)editable;
+  AppState *state = user_data;
+  state->chinese_candidate_navigated = FALSE;
 }
 
 static void
@@ -950,6 +1400,76 @@ on_key_pressed(GtkEventControllerKey *controller,
   (void)state_modifiers;
   AppState *state = user_data;
 
+  if (state->active_chinese_candidates &&
+      state->active_chinese_candidates->len > 0) {
+    if (keyval == GDK_KEY_Down) {
+      if (state->entry && !gtk_widget_has_focus(state->entry)) {
+        gtk_widget_grab_focus(state->entry);
+      }
+      state->selected_chinese_candidate =
+          (state->selected_chinese_candidate + 1) %
+          (int)state->active_chinese_candidates->len;
+      state->chinese_candidate_navigated = TRUE;
+      update_chinese_candidate_selection(state);
+      return TRUE;
+    }
+    if (keyval == GDK_KEY_Up) {
+      if (state->entry && !gtk_widget_has_focus(state->entry)) {
+        gtk_widget_grab_focus(state->entry);
+      }
+      state->selected_chinese_candidate =
+          (state->selected_chinese_candidate - 1 +
+           (int)state->active_chinese_candidates->len) %
+          (int)state->active_chinese_candidates->len;
+      state->chinese_candidate_navigated = TRUE;
+      update_chinese_candidate_selection(state);
+      return TRUE;
+    }
+    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+      if (state->entry && !gtk_widget_has_focus(state->entry)) {
+        gtk_widget_grab_focus(state->entry);
+      }
+      if (chinese_candidate_query_is_current(state)) {
+        open_selected_chinese_candidate(state);
+      } else {
+        perform_lookup(state, gtk_editable_get_text(GTK_EDITABLE(state->entry)));
+      }
+      return TRUE;
+    }
+  }
+
+  if (keyval == GDK_KEY_Down || keyval == GDK_KEY_Up) {
+    if (state->entry && !gtk_widget_has_focus(state->entry)) {
+      gtk_widget_grab_focus(state->entry);
+    }
+    int direction = keyval == GDK_KEY_Down ? 1 : -1;
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+    if (scroll_web_result(state, direction)) {
+      return TRUE;
+    }
+#endif
+    if (state->scrolled_window && gtk_widget_get_visible(state->scrolled_window)) {
+      GtkAdjustment *adjustment =
+          gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(state->scrolled_window));
+      double step = gtk_adjustment_get_step_increment(adjustment);
+      if (step <= 0.0) {
+        step = 72.0;
+      }
+      double max = gtk_adjustment_get_upper(adjustment) -
+                   gtk_adjustment_get_page_size(adjustment);
+      if (max < gtk_adjustment_get_lower(adjustment)) {
+        max = gtk_adjustment_get_lower(adjustment);
+      }
+      double value = gtk_adjustment_get_value(adjustment) + direction * step;
+      gtk_adjustment_set_value(adjustment,
+                               CLAMP(value,
+                                     gtk_adjustment_get_lower(adjustment),
+                                     max));
+      return TRUE;
+    }
+    return TRUE;
+  }
+
   if (keyval == GDK_KEY_Escape) {
     hide_window(state);
     return TRUE;
@@ -990,6 +1510,7 @@ ensure_window(AppState *state)
   gtk_entry_set_placeholder_text(GTK_ENTRY(state->entry), "");
   gtk_widget_add_css_class(state->entry, "lookup-entry");
   gtk_box_append(GTK_BOX(root), state->entry);
+  g_signal_connect(state->entry, "changed", G_CALLBACK(on_entry_changed), state);
   g_signal_connect(state->entry, "activate", G_CALLBACK(on_entry_activate), state);
 
   state->status_label = make_label("", "status");
@@ -998,6 +1519,7 @@ ensure_window(AppState *state)
 
   state->scrolled_window = gtk_scrolled_window_new();
   gtk_widget_add_css_class(state->scrolled_window, "result-scroll");
+  gtk_widget_set_focusable(state->scrolled_window, FALSE);
   gtk_widget_set_vexpand(state->scrolled_window, TRUE);
   gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(state->scrolled_window),
                                  GTK_POLICY_NEVER,
@@ -1007,6 +1529,7 @@ ensure_window(AppState *state)
 
   state->result_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
   gtk_widget_add_css_class(state->result_box, "result-box");
+  gtk_widget_set_focusable(state->result_box, FALSE);
   gtk_widget_set_margin_top(state->result_box, 6);
   gtk_widget_set_margin_bottom(state->result_box, 12);
   gtk_widget_set_margin_start(state->result_box, 2);
@@ -1020,6 +1543,7 @@ ensure_window(AppState *state)
   webkit_web_view_set_background_color(WEBKIT_WEB_VIEW(state->web_view),
                                        &web_background);
   gtk_widget_set_vexpand(state->web_view, TRUE);
+  gtk_widget_set_focusable(state->web_view, FALSE);
   gtk_widget_set_visible(state->web_view, FALSE);
   g_signal_connect(state->web_view,
                    "load-changed",
@@ -1037,6 +1561,7 @@ ensure_window(AppState *state)
 #endif
 
   GtkEventController *key_controller = gtk_event_controller_key_new();
+  gtk_event_controller_set_propagation_phase(key_controller, GTK_PHASE_CAPTURE);
   g_signal_connect(key_controller, "key-pressed", G_CALLBACK(on_key_pressed), state);
   gtk_widget_add_controller(state->window, key_controller);
   g_idle_add(warm_local_reader_idle, state);
@@ -1095,6 +1620,11 @@ install_css(void)
       ".definition { font-size: 15px; }"
       ".example { font-size: 14px; color: #3a3a3a; margin-left: 14px; }"
       ".definition-block { padding: 2px 0 4px 0; }"
+      ".candidate-row { padding: 8px 10px; background-color: rgba(255,255,255,0.72); color: #202124; border-radius: 0; }"
+      ".candidate-row.selected { background-color: rgba(26,95,180,0.16); outline: 1px solid rgba(26,95,180,0.36); }"
+      ".candidate-word { font-size: 17px; font-weight: 700; }"
+      ".candidate-pos { font-size: 13px; color: #1a5fb4; }"
+      ".candidate-snippet { font-size: 14px; color: #2f3437; }"
       ".muted, .small, .status { color: #3a3a3a; }"
       ".small { font-size: 13px; }"
       ".error { color: #b3261e; font-weight: 600; }");
@@ -1212,6 +1742,41 @@ check_local_dictionary_command(AppState *state,
   return status;
 }
 
+static int
+rebuild_chinese_index_command(AppState *state,
+                              GApplicationCommandLine *command_line)
+{
+  if (!state->chinese_index) {
+    GError *index_error = NULL;
+    state->chinese_index = chinese_index_new(&index_error);
+    if (!state->chinese_index) {
+      g_application_command_line_printerr(command_line,
+                                          "Chinese index is unavailable: %s\n",
+                                          index_error ? index_error->message : "unknown error");
+      g_clear_error(&index_error);
+      return 1;
+    }
+  }
+  if (!state->chinese_index) {
+    g_application_command_line_printerr(command_line,
+                                        "Chinese index is unavailable.\n");
+    return 1;
+  }
+
+  g_autofree char *dict_dir = local_dictionary_resolve_dir(state->configured_dict_dir);
+  GError *error = NULL;
+  if (!chinese_index_rebuild(state->chinese_index, dict_dir, &error)) {
+    g_application_command_line_printerr(command_line,
+                                        "Failed to rebuild Chinese index: %s\n",
+                                        error ? error->message : "unknown error");
+    g_clear_error(&error);
+    return 1;
+  }
+
+  g_application_command_line_print(command_line, "Chinese index rebuilt.\n");
+  return 0;
+}
+
 static void
 on_activate(GtkApplication *application, gpointer user_data)
 {
@@ -1234,6 +1799,12 @@ on_command_line(GApplication *application,
   const char *check_query = arg_value(args, "--check-dict");
   if (check_query) {
     int status = check_local_dictionary_command(state, command_line, check_query);
+    g_strfreev(args);
+    return status;
+  }
+
+  if (has_arg(args, "--rebuild-chinese-index")) {
+    int status = rebuild_chinese_index_command(state, command_line);
     g_strfreev(args);
     return status;
   }
@@ -1281,9 +1852,15 @@ app_state_free(AppState *state)
     g_clear_object(&state->lookup_cancellable);
   }
   lookup_cache_free(state->cache);
+  chinese_index_free(state->chinese_index);
   local_dictionary_reader_free(state->local_reader);
   audio_player_free(state->audio_player);
+  if (state->active_chinese_candidates) {
+    g_ptr_array_unref(state->active_chinese_candidates);
+  }
   g_free(state->active_query_key);
+  g_free(state->active_chinese_candidate_query);
+  g_free(state->pending_chinese_query);
   g_free(state->configured_dict_dir);
   g_free(state->requested_monitor_name);
   g_free(state);

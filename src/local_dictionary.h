@@ -20,6 +20,10 @@ typedef struct {
   char *message;
 } LocalDictionaryLookupResult;
 
+typedef int (*LocalDictionaryEntryCallback)(const char *key,
+                                            const char *html,
+                                            gpointer user_data);
+
 char *local_dictionary_resolve_dir(const char *explicit_dir);
 
 LocalDictionaryReader *local_dictionary_reader_new(const char *dict_dir,
@@ -27,12 +31,21 @@ LocalDictionaryReader *local_dictionary_reader_new(const char *dict_dir,
 void local_dictionary_reader_free(LocalDictionaryReader *reader);
 
 const char *local_dictionary_reader_get_dir(LocalDictionaryReader *reader);
+gboolean local_dictionary_reader_get_source_identity(LocalDictionaryReader *reader,
+                                                     char **mdx_path,
+                                                     gint64 *mdx_size,
+                                                     gint64 *mdx_mtime,
+                                                     GError **error);
 gboolean local_dictionary_reader_warm_up(LocalDictionaryReader *reader,
                                          GError **error);
 
 LocalDictionaryLookupResult *
 local_dictionary_reader_lookup(LocalDictionaryReader *reader,
                                const char *query);
+gboolean local_dictionary_reader_iter_entries(LocalDictionaryReader *reader,
+                                              LocalDictionaryEntryCallback callback,
+                                              gpointer user_data,
+                                              GError **error);
 void local_dictionary_lookup_result_free(LocalDictionaryLookupResult *result);
 
 GBytes *local_dictionary_reader_load_asset(LocalDictionaryReader *reader,
