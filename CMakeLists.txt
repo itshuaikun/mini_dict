@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-project(mini_dict C)
+project(mini_dict VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -51,7 +51,10 @@ set(MINI_DICT_LDOCE_READER_LIB
 function(mini_dict_configure_target target)
   target_include_directories(${target} PRIVATE src)
   target_link_libraries(${target} PRIVATE PkgConfig::APP_DEPS)
-  target_compile_definitions(${target} PRIVATE MINI_DICT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  target_compile_definitions(${target} PRIVATE
+    MINI_DICT_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    MINI_DICT_VERSION="${PROJECT_VERSION}"
+  )
 
   if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)

@@ -63,6 +63,18 @@ Run:
 ./build/mini-dict
 ```
 
+Show supported command-line options:
+
+```sh
+./build/mini-dict --help
+```
+
+Show the installed version:
+
+```sh
+./build/mini-dict --version
+```
+
 Use a local LDOCE directory:
 
 ```sh
