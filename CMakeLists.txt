@@ -78,6 +78,7 @@ add_executable(mini-dict
   src/cache.c
   src/chinese_index.c
   src/dictionary.c
+  src/dictionary_page_link.c
   src/local_dictionary.c
 )
 mini_dict_configure_target(mini-dict)
@@ -118,6 +119,14 @@ add_executable(test-dictionary-parser
 mini_dict_configure_target(test-dictionary-parser)
 
 add_test(NAME dictionary-parser COMMAND test-dictionary-parser)
+
+add_executable(test-dictionary-page-link
+  tests/test_dictionary_page_link.c
+  src/dictionary_page_link.c
+)
+mini_dict_configure_target(test-dictionary-page-link)
+
+add_test(NAME dictionary-page-link COMMAND test-dictionary-page-link)
 
 add_executable(test-local-dictionary
   tests/test_local_dictionary.c

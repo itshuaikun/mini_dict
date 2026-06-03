@@ -4,6 +4,7 @@
 #include "cache.h"
 #include "chinese_index.h"
 #include "dictionary.h"
+#include "dictionary_page_link.h"
 #include "local_dictionary.h"
 
 #include <gtk4-layer-shell.h>
@@ -929,6 +930,20 @@ on_web_view_decide_policy(WebKitWebView *web_view,
   if (uri && g_str_has_prefix(uri, SOUND_URI_PREFIX)) {
     webkit_policy_decision_ignore(decision);
     return play_local_dictionary_sound(state, uri);
+  }
+
+  const char *dict_dir =
+      state->local_reader ? local_dictionary_reader_get_dir(state->local_reader) : NULL;
+  g_autofree char *linked_query =
+      dictionary_page_link_uri_to_query(uri, dict_dir);
+  if (linked_query) {
+    webkit_policy_decision_ignore(decision);
+    gtk_editable_set_text(GTK_EDITABLE(state->entry), linked_query);
+    g_free(state->active_query_key);
+    state->active_query_key = normalize_query(linked_query);
+    show_status(state, "");
+    perform_local_lookup(state, linked_query);
+    return TRUE;
   }
 
   return FALSE;
