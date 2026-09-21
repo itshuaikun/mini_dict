@@ -30,6 +30,11 @@ GPtrArray *chinese_index_query(ChineseIndex *index,
                                guint limit,
                                GError **error);
 
+GPtrArray *chinese_index_prefix_query(ChineseIndex *index,
+                                      const char *prefix,
+                                      guint limit,
+                                      GError **error);
+
 void chinese_index_candidate_free(gpointer data);
 
 #endif

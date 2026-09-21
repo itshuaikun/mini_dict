@@ -376,6 +376,7 @@ local_dictionary_reader_iter_entries(LocalDictionaryReader *reader,
   }
   return TRUE;
 #else
+  (void)user_data;
   g_set_error(error,
               local_dictionary_error_quark(),
               14,

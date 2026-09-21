@@ -6,6 +6,7 @@ A small GTK4 dictionary lookup window for Linux Wayland desktops.
 
 - English word and common short phrase lookup
 - One-line wake/input window
+- Live English headword Prefix Suggestions while typing, matched by headword prefix
 - Full scrollable LDOCE 5++ V2.15 dictionary result after pressing Enter
 - British and American phonetic text when available
 - Chinese meanings from the local LDOCE dictionary source
@@ -22,6 +23,14 @@ The first version does not support sentence translation, selected-text capture, 
 - Use a lightly translucent GTK window so text behind the lookup surface remains faintly visible.
 - Keep the interface plain, fast, and keyboard-friendly.
 - Do not add blur, animation, decorative gradients, floating effects, or other visual effects that do not directly improve lookup speed or readability.
+
+## Prefix Suggestions
+
+While an English Lookup Query is being typed, Mini Dict shows up to 15 local headwords whose entry key starts with the typed text, together with the part of speech and a short Chinese meaning. Up and Down move the selection, Enter opens the highlighted candidate once a selection is made, and clicking a row opens it. Without a selection, Enter performs the normal exact lookup, so a complete headword such as `rose` still opens its own entry even when it is missing from the suggestion index.
+
+Typing is never interrupted: refreshing the list keeps the input caret where it is instead of selecting the whole query. Clearing the input returns the window to its empty state.
+
+Suggestions come from the same local index as Chinese reverse lookup, so they need no network access. If that index has not been built yet, Mini Dict builds it in the background and shows suggestions once it is ready. `--rebuild-chinese-index` rebuilds the index on demand.
 
 ## Dependencies
 
@@ -93,6 +102,12 @@ Check that the local LDOCE reader can resolve an entry without opening the UI:
 
 ```sh
 ./build/mini-dict --dict-dir "/path/to/LDOCE 5++ V2.15" --check-dict apple
+```
+
+Check local Prefix Suggestions without opening the UI:
+
+```sh
+./build/mini-dict --dict-dir "/path/to/LDOCE 5++ V2.15" --suggest pre
 ```
 
 Rebuild the local Chinese reverse lookup index:

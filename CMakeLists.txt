@@ -128,6 +128,15 @@ mini_dict_configure_target(test-dictionary-page-link)
 
 add_test(NAME dictionary-page-link COMMAND test-dictionary-page-link)
 
+add_executable(test-chinese-index
+  tests/test_chinese_index.c
+  src/chinese_index.c
+  src/local_dictionary.c
+)
+mini_dict_configure_target(test-chinese-index)
+
+add_test(NAME chinese-index COMMAND test-chinese-index)
+
 add_executable(test-local-dictionary
   tests/test_local_dictionary.c
   src/local_dictionary.c

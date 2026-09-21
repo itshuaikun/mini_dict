@@ -32,6 +32,10 @@ _Avoid_: Quick summary, short card
 The most exact Local Dictionary Source entry for a Lookup Query. It may contain the source's own phrases, word families, and cross-references, but it does not mean Mini Dict has merged several candidate entries into one result.
 _Avoid_: Search results list, merged candidates, related-word browser
 
+**Prefix Suggestion**:
+A candidate Main Dictionary Entry offered while the user is still typing an English Lookup Query, matched because its headword starts with the typed text. It is a shortcut for choosing a Lookup Query, not a Lookup Result, not a merged result list, and not an online suggestion.
+_Avoid_: Autocomplete answer, search results, translation suggestion
+
 **Native Example Sentence**:
 An English sentence that shows natural usage of a word or short phrase. It should read like authentic English, not a literal translation from Chinese. It may belong to a specific meaning or to the Lookup Result as a whole.
 _Avoid_: Translated example, machine-made example
@@ -141,6 +145,10 @@ Domain expert: No. A Full Dictionary Page should preserve the Local Dictionary S
 Dev: If several local entries resemble the Lookup Query, should Mini Dict merge them?
 
 Domain expert: No. It should show the Main Dictionary Entry and rely on the Local Dictionary Source's own cross-references.
+
+Dev: Should Mini Dict show matching headwords while the user is still typing?
+
+Domain expert: Yes, as Prefix Suggestions. They only help the user choose a Lookup Query; the Lookup Result still comes from the chosen Main Dictionary Entry.
 
 Dev: Should the Wake Shortcut look up the currently selected word?
 

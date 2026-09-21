@@ -21,6 +21,8 @@
 #define RESULT_WINDOW_HEIGHT 520
 #define INPUT_WINDOW_WIDTH RESULT_WINDOW_WIDTH
 #define INPUT_WINDOW_HEIGHT 64
+#define PREFIX_SUGGESTION_DELAY_MS 50
+#define PREFIX_SUGGESTION_LIMIT 15
 #define SOUND_URI_PREFIX "sound://"
 
 typedef struct {
@@ -38,18 +40,19 @@ typedef struct {
   LocalDictionaryReader *local_reader;
   AudioPlayer *audio_player;
   GCancellable *lookup_cancellable;
-  GPtrArray *active_chinese_candidates;
+  GPtrArray *active_candidates;
   char *active_query_key;
-  char *active_chinese_candidate_query;
+  char *active_candidate_query;
   char *pending_chinese_query;
   char *configured_dict_dir;
   char *requested_monitor_name;
+  guint prefix_suggestion_timeout;
   gboolean css_installed;
   gboolean displaying_cached_result;
   gboolean hidden_by_shortcut;
   gboolean chinese_index_building;
-  gboolean chinese_candidate_navigated;
-  int selected_chinese_candidate;
+  gboolean suppress_entry_changed;
+  int selected_candidate;
 #ifdef MINI_DICT_HAVE_WEBKITGTK
   gboolean pending_web_result;
 #endif
@@ -60,19 +63,45 @@ static void ensure_css(AppState *state);
 static void perform_online_lookup(AppState *state, const char *query);
 static void perform_local_lookup(AppState *state, const char *query);
 static void perform_chinese_lookup(AppState *state, const char *query);
+static void show_prefix_suggestions(AppState *state, const char *input);
 static gboolean warm_local_reader_idle(gpointer user_data);
 
 static void
-clear_chinese_candidate_state(AppState *state)
+clear_candidate_state(AppState *state)
 {
-  if (state->active_chinese_candidates) {
-    g_ptr_array_unref(state->active_chinese_candidates);
-    state->active_chinese_candidates = NULL;
+  if (state->active_candidates) {
+    g_ptr_array_unref(state->active_candidates);
+    state->active_candidates = NULL;
   }
-  g_free(state->active_chinese_candidate_query);
-  state->active_chinese_candidate_query = NULL;
-  state->chinese_candidate_navigated = FALSE;
-  state->selected_chinese_candidate = -1;
+  g_free(state->active_candidate_query);
+  state->active_candidate_query = NULL;
+  state->selected_candidate = -1;
+}
+
+static void
+clear_prefix_suggestion_timeout(AppState *state)
+{
+  if (state->prefix_suggestion_timeout) {
+    g_source_remove(state->prefix_suggestion_timeout);
+    state->prefix_suggestion_timeout = 0;
+  }
+}
+
+static void
+focus_entry_without_selecting(AppState *state)
+{
+  if (state->entry) {
+    gtk_entry_grab_focus_without_selecting(GTK_ENTRY(state->entry));
+  }
+}
+
+static void
+set_entry_text(AppState *state, const char *text)
+{
+  clear_prefix_suggestion_timeout(state);
+  state->suppress_entry_changed = TRUE;
+  gtk_editable_set_text(GTK_EDITABLE(state->entry), text);
+  state->suppress_entry_changed = FALSE;
 }
 
 static void
@@ -185,10 +214,25 @@ show_web_result_area(AppState *state)
 }
 #endif
 
+/* Re-rendering the native area on every keystroke would queue a window resize
+ * each time, so only switch to it when it is not already showing. */
+static void
+ensure_native_result_area(AppState *state)
+{
+  gboolean needs_switch = !gtk_widget_get_visible(state->scrolled_window);
+#ifdef MINI_DICT_HAVE_WEBKITGTK
+  needs_switch = needs_switch ||
+                 (state->web_view && gtk_widget_get_visible(state->web_view));
+#endif
+  if (needs_switch) {
+    show_native_result_area(state);
+  }
+}
+
 static void
 show_loading(AppState *state, const char *query)
 {
-  clear_chinese_candidate_state(state);
+  clear_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -200,9 +244,21 @@ show_loading(AppState *state, const char *query)
 }
 
 static void
+show_input_hint(AppState *state)
+{
+  clear_candidate_state(state);
+  state->displaying_cached_result = FALSE;
+  show_native_result_area(state);
+  clear_box(state->result_box);
+  gtk_box_append(GTK_BOX(state->result_box),
+                 make_label("Type an English word, or 1 to 8 Chinese characters.", "muted"));
+  show_status(state, "");
+}
+
+static void
 show_error(AppState *state, const char *message)
 {
-  clear_chinese_candidate_state(state);
+  clear_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -366,7 +422,7 @@ append_phonetic(GtkWidget *row,
 static void
 render_lookup_result(AppState *state, LookupResult *result, gboolean from_cache)
 {
-  clear_chinese_candidate_state(state);
+  clear_candidate_state(state);
   state->displaying_cached_result = from_cache;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -433,7 +489,7 @@ make_online_fallback_button(AppState *state, const char *query)
 static void
 show_no_local_entry(AppState *state, const char *query)
 {
-  clear_chinese_candidate_state(state);
+  clear_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -445,7 +501,7 @@ show_no_local_entry(AppState *state, const char *query)
 static void
 show_local_dictionary_issue(AppState *state, const char *message)
 {
-  clear_chinese_candidate_state(state);
+  clear_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -458,7 +514,7 @@ show_local_dictionary_issue(AppState *state, const char *message)
 static void
 show_local_lookup_error(AppState *state, const char *message)
 {
-  clear_chinese_candidate_state(state);
+  clear_candidate_state(state);
   state->displaying_cached_result = FALSE;
   show_native_result_area(state);
   clear_box(state->result_box);
@@ -531,7 +587,7 @@ ensure_chinese_index(AppState *state)
 }
 
 static void
-update_chinese_candidate_selection(AppState *state)
+update_candidate_selection(AppState *state)
 {
   GtkWidget *selected_child = NULL;
   GtkWidget *child = gtk_widget_get_first_child(state->result_box);
@@ -539,7 +595,7 @@ update_chinese_candidate_selection(AppState *state)
     gpointer stored_index = g_object_get_data(G_OBJECT(child), "candidate-index");
     if (stored_index) {
       int index = GPOINTER_TO_INT(stored_index) - 1;
-      if (index == state->selected_chinese_candidate) {
+      if (index == state->selected_candidate) {
         gtk_widget_add_css_class(child, "selected");
         selected_child = child;
       } else {
@@ -584,61 +640,61 @@ update_chinese_candidate_selection(AppState *state)
 }
 
 static gboolean
-chinese_candidate_query_is_current(AppState *state)
+candidate_query_is_current(AppState *state)
 {
-  if (!state->active_chinese_candidates ||
-      state->active_chinese_candidates->len == 0 ||
-      !state->active_chinese_candidate_query) {
+  if (!state->active_candidates ||
+      state->active_candidates->len == 0 ||
+      !state->active_candidate_query) {
     return FALSE;
   }
 
   const char *entry_text = gtk_editable_get_text(GTK_EDITABLE(state->entry));
-  return g_strcmp0(entry_text, state->active_chinese_candidate_query) == 0;
+  return g_strcmp0(entry_text, state->active_candidate_query) == 0;
 }
 
 static void
-open_selected_chinese_candidate(AppState *state)
+open_selected_candidate(AppState *state)
 {
-  if (!state->active_chinese_candidates ||
-      state->selected_chinese_candidate < 0 ||
-      (guint)state->selected_chinese_candidate >= state->active_chinese_candidates->len) {
+  if (!state->active_candidates ||
+      state->selected_candidate < 0 ||
+      (guint)state->selected_candidate >= state->active_candidates->len) {
     return;
   }
 
   ChineseIndexCandidate *candidate =
-      g_ptr_array_index(state->active_chinese_candidates,
-                        (guint)state->selected_chinese_candidate);
+      g_ptr_array_index(state->active_candidates,
+                        (guint)state->selected_candidate);
   if (!candidate || !candidate->entry_key) {
     return;
   }
 
   g_autofree char *entry_key = g_strdup(candidate->entry_key);
-  gtk_editable_set_text(GTK_EDITABLE(state->entry), entry_key);
+  set_entry_text(state, entry_key);
   g_free(state->active_query_key);
   state->active_query_key = normalize_query(entry_key);
   perform_local_lookup(state, entry_key);
 }
 
 static void
-on_chinese_candidate_clicked(GtkButton *button, gpointer user_data)
+on_candidate_clicked(GtkButton *button, gpointer user_data)
 {
   AppState *state = user_data;
-  state->selected_chinese_candidate =
+  state->selected_candidate =
       GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "candidate-index")) - 1;
-  open_selected_chinese_candidate(state);
+  open_selected_candidate(state);
 }
 
 static GtkWidget *
-make_chinese_candidate_button(AppState *state,
-                              ChineseIndexCandidate *candidate,
-                              guint index)
+make_candidate_button(AppState *state,
+                      ChineseIndexCandidate *candidate,
+                      guint index)
 {
   GtkWidget *button = gtk_button_new();
   gtk_widget_add_css_class(button, "candidate-row");
   gtk_widget_set_halign(button, GTK_ALIGN_FILL);
   gtk_widget_set_focusable(button, FALSE);
   g_object_set_data(G_OBJECT(button), "candidate-index", GINT_TO_POINTER((int)index + 1));
-  g_signal_connect(button, "clicked", G_CALLBACK(on_chinese_candidate_clicked), state);
+  g_signal_connect(button, "clicked", G_CALLBACK(on_candidate_clicked), state);
 
   GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
   gtk_widget_set_halign(box, GTK_ALIGN_FILL);
@@ -656,12 +712,17 @@ make_chinese_candidate_button(AppState *state,
   return button;
 }
 
+/* `current_text` is the exact entry text this candidate list belongs to, so that
+ * pressing Enter only opens a candidate while the input is unchanged. */
 static void
-render_chinese_candidates(AppState *state, const char *query, GPtrArray *candidates)
+render_candidate_list(AppState *state,
+                      const char *current_text,
+                      GPtrArray *candidates,
+                      gboolean is_chinese)
 {
-  clear_chinese_candidate_state(state);
+  clear_candidate_state(state);
   state->displaying_cached_result = FALSE;
-  show_native_result_area(state);
+  ensure_native_result_area(state);
   clear_box(state->result_box);
   show_status(state, "");
 
@@ -670,29 +731,32 @@ render_chinese_candidates(AppState *state, const char *query, GPtrArray *candida
       g_ptr_array_unref(candidates);
     }
     g_autofree char *message =
-        g_strdup_printf("No English entries found for \"%s\".", query);
+        is_chinese
+            ? g_strdup_printf("No English entries found for \"%s\".", current_text)
+            : g_strdup_printf("No local entry starts with \"%s\".", current_text);
     gtk_box_append(GTK_BOX(state->result_box), make_label(message, "muted"));
     return;
   }
 
-  state->active_chinese_candidates = candidates;
-  state->active_chinese_candidate_query = g_strdup(query);
-  state->chinese_candidate_navigated = FALSE;
-  state->selected_chinese_candidate = 0;
+  state->active_candidates = candidates;
+  state->active_candidate_query = g_strdup(current_text);
+  /* A Chinese query opens its first candidate; prefix suggestions stay
+   * unhighlighted until the user moves the selection, so that Enter keeps
+   * performing the exact Lookup Query. */
+  state->selected_candidate = is_chinese ? 0 : -1;
 
   for (guint i = 0; i < candidates->len; i++) {
     ChineseIndexCandidate *candidate = g_ptr_array_index(candidates, i);
     gtk_box_append(GTK_BOX(state->result_box),
-                   make_chinese_candidate_button(state, candidate, i));
+                   make_candidate_button(state, candidate, i));
   }
-  update_chinese_candidate_selection(state);
-  gtk_widget_grab_focus(state->entry);
+  update_candidate_selection(state);
+  focus_entry_without_selecting(state);
 }
 
 typedef struct {
   ChineseIndex *index;
   char *dict_dir;
-  char *query;
 } ChineseIndexBuildTask;
 
 static void
@@ -702,7 +766,6 @@ chinese_index_build_task_free(ChineseIndexBuildTask *task)
     return;
   }
   g_free(task->dict_dir);
-  g_free(task->query);
   g_free(task);
 }
 
@@ -734,14 +797,23 @@ on_chinese_index_built(GObject *source_object,
 
   GError *error = NULL;
   if (!g_task_propagate_boolean(G_TASK(result), &error)) {
-    show_local_lookup_error(state,
-                            error ? error->message : "Chinese reverse lookup is unavailable.");
+    /* A warm-up failure only costs prefix suggestions, so it stays silent. */
+    if (state->pending_chinese_query) {
+      show_local_lookup_error(state,
+                              error ? error->message : "Chinese reverse lookup is unavailable.");
+    }
     g_clear_error(&error);
     g_application_release(G_APPLICATION(state->application));
     return;
   }
 
   if (!state->pending_chinese_query) {
+    /* The build was a warm-up for prefix suggestions: refresh the list for
+     * whatever the user has typed in the meantime. */
+    const char *entry_text = gtk_editable_get_text(GTK_EDITABLE(state->entry));
+    if (entry_text && entry_text[0] != '\0' && !contains_han(entry_text)) {
+      show_prefix_suggestions(state, entry_text);
+    }
     g_application_release(G_APPLICATION(state->application));
     return;
   }
@@ -753,13 +825,17 @@ on_chinese_index_built(GObject *source_object,
   g_application_release(G_APPLICATION(state->application));
 }
 
+/* `chinese_query` is the pending Chinese Lookup Query that needs the index, or
+ * NULL when the index is only being warmed up for prefix suggestions. */
 static void
-start_chinese_index_build(AppState *state, const char *query)
+start_index_build(AppState *state, const char *chinese_query)
 {
   if (state->chinese_index_building) {
-    g_free(state->pending_chinese_query);
-    state->pending_chinese_query = g_strdup(query);
-    show_status(state, "Building Chinese index...");
+    if (chinese_query) {
+      g_free(state->pending_chinese_query);
+      state->pending_chinese_query = g_strdup(chinese_query);
+      show_status(state, "Building dictionary index...");
+    }
     return;
   }
 
@@ -767,13 +843,18 @@ start_chinese_index_build(AppState *state, const char *query)
   ChineseIndexBuildTask *build_task = g_new0(ChineseIndexBuildTask, 1);
   build_task->index = state->chinese_index;
   build_task->dict_dir = g_strdup(dict_dir);
-  build_task->query = g_strdup(query);
 
   g_free(state->pending_chinese_query);
-  state->pending_chinese_query = g_strdup(query);
+  state->pending_chinese_query = g_strdup(chinese_query);
   state->chinese_index_building = TRUE;
-  show_loading(state, query);
-  show_status(state, "Building Chinese index...");
+  if (chinese_query) {
+    show_loading(state, chinese_query);
+  } else {
+    clear_candidate_state(state);
+    show_native_result_area(state);
+    clear_box(state->result_box);
+  }
+  show_status(state, "Building dictionary index...");
 
   GTask *task = g_task_new(NULL, NULL, on_chinese_index_built, state);
   g_task_set_task_data(task,
@@ -864,7 +945,7 @@ local_dictionary_base_uri(AppState *state)
 static void
 render_local_dictionary_page(AppState *state, LocalDictionaryLookupResult *result)
 {
-  clear_chinese_candidate_state(state);
+  clear_candidate_state(state);
   state->pending_web_result = TRUE;
   show_status(state, "");
   g_autofree char *document = build_local_dictionary_document(result);
@@ -886,7 +967,7 @@ on_web_view_load_changed(WebKitWebView *web_view,
   state->pending_web_result = FALSE;
   show_web_result_area(state);
   show_status(state, "");
-  gtk_widget_grab_focus(state->entry);
+  focus_entry_without_selecting(state);
 }
 
 static gboolean
@@ -938,7 +1019,7 @@ on_web_view_decide_policy(WebKitWebView *web_view,
       dictionary_page_link_uri_to_query(uri, dict_dir);
   if (linked_query) {
     webkit_policy_decision_ignore(decision);
-    gtk_editable_set_text(GTK_EDITABLE(state->entry), linked_query);
+    set_entry_text(state, linked_query);
     g_free(state->active_query_key);
     state->active_query_key = normalize_query(linked_query);
     show_status(state, "");
@@ -1083,7 +1164,7 @@ perform_chinese_lookup(AppState *state, const char *query)
   }
 
   if (!ready) {
-    start_chinese_index_build(state, query);
+    start_index_build(state, query);
     return;
   }
 
@@ -1097,7 +1178,7 @@ perform_chinese_lookup(AppState *state, const char *query)
     g_clear_error(&error);
     return;
   }
-  render_chinese_candidates(state, query, candidates);
+  render_candidate_list(state, query, candidates, TRUE);
 }
 
 static void
@@ -1193,6 +1274,7 @@ perform_online_lookup(AppState *state, const char *query)
 static void
 perform_lookup(AppState *state, const char *input)
 {
+  clear_prefix_suggestion_timeout(state);
   g_autofree char *copy = g_strdup(input ? input : "");
   g_strstrip(copy);
 
@@ -1202,7 +1284,7 @@ perform_lookup(AppState *state, const char *input)
       show_error(state, "Chinese lookup supports 1 to 8 Han characters.");
       return;
     }
-    gtk_editable_set_text(GTK_EDITABLE(state->entry), copy);
+    set_entry_text(state, copy);
     show_status(state, "");
     perform_chinese_lookup(state, copy);
     return;
@@ -1220,30 +1302,108 @@ perform_lookup(AppState *state, const char *input)
     return;
   }
 
-  gtk_editable_set_text(GTK_EDITABLE(state->entry), query);
+  set_entry_text(state, query);
   g_free(state->active_query_key);
   state->active_query_key = normalize_query(query);
   show_status(state, "");
   perform_local_lookup(state, query);
 }
 
+/* Enter opens the highlighted candidate. Chinese candidate lists always start
+ * with a selection; prefix suggestions only have one after the user moved the
+ * selection, so otherwise Enter keeps the exact Lookup Query behaviour. */
+static void
+submit_current_input(AppState *state)
+{
+  if (candidate_query_is_current(state) && state->selected_candidate >= 0) {
+    open_selected_candidate(state);
+    return;
+  }
+  perform_lookup(state, gtk_editable_get_text(GTK_EDITABLE(state->entry)));
+}
+
 static void
 on_entry_activate(GtkEntry *entry, gpointer user_data)
 {
+  (void)entry;
+  submit_current_input(user_data);
+}
+
+static gboolean
+on_prefix_suggestion_timeout(gpointer user_data)
+{
   AppState *state = user_data;
-  if (chinese_candidate_query_is_current(state)) {
-    open_selected_chinese_candidate(state);
-    return;
-  }
-  perform_lookup(state, gtk_editable_get_text(GTK_EDITABLE(entry)));
+  state->prefix_suggestion_timeout = 0;
+  show_prefix_suggestions(state, gtk_editable_get_text(GTK_EDITABLE(state->entry)));
+  return G_SOURCE_REMOVE;
 }
 
 static void
 on_entry_changed(GtkEditable *editable, gpointer user_data)
 {
-  (void)editable;
   AppState *state = user_data;
-  state->chinese_candidate_navigated = FALSE;
+  if (state->suppress_entry_changed) {
+    return;
+  }
+
+  clear_prefix_suggestion_timeout(state);
+
+  gboolean had_candidates = state->active_candidates != NULL;
+
+  const char *text = gtk_editable_get_text(editable);
+  if (!text || text[0] == '\0' || contains_han(text)) {
+    if (had_candidates) {
+      show_input_hint(state);
+    } else {
+      clear_candidate_state(state);
+    }
+    return;
+  }
+
+  state->prefix_suggestion_timeout =
+      g_timeout_add(PREFIX_SUGGESTION_DELAY_MS, on_prefix_suggestion_timeout, state);
+}
+
+static void
+show_prefix_suggestions(AppState *state, const char *input)
+{
+  if (!input || input[0] == '\0' || contains_han(input)) {
+    return;
+  }
+
+  g_autofree char *query = normalize_query(input);
+  if (query[0] == '\0') {
+    return;
+  }
+
+  if (!ensure_local_reader(state) || !ensure_chinese_index(state)) {
+    return;
+  }
+
+  gboolean ready = FALSE;
+  GError *error = NULL;
+  if (!chinese_index_is_ready(state->chinese_index,
+                              state->local_reader,
+                              &ready,
+                              &error)) {
+    g_clear_error(&error);
+    return;
+  }
+  if (!ready) {
+    start_index_build(state, NULL);
+    return;
+  }
+
+  GPtrArray *candidates = chinese_index_prefix_query(state->chinese_index,
+                                                     query,
+                                                     PREFIX_SUGGESTION_LIMIT,
+                                                     &error);
+  if (!candidates) {
+    g_clear_error(&error);
+    return;
+  }
+
+  render_candidate_list(state, input, candidates, FALSE);
 }
 
 static void
@@ -1415,48 +1575,33 @@ on_key_pressed(GtkEventControllerKey *controller,
   (void)state_modifiers;
   AppState *state = user_data;
 
-  if (state->active_chinese_candidates &&
-      state->active_chinese_candidates->len > 0) {
+  if (state->active_candidates && state->active_candidates->len > 0) {
+    int candidate_count = (int)state->active_candidates->len;
     if (keyval == GDK_KEY_Down) {
-      if (state->entry && !gtk_widget_has_focus(state->entry)) {
-        gtk_widget_grab_focus(state->entry);
-      }
-      state->selected_chinese_candidate =
-          (state->selected_chinese_candidate + 1) %
-          (int)state->active_chinese_candidates->len;
-      state->chinese_candidate_navigated = TRUE;
-      update_chinese_candidate_selection(state);
+      focus_entry_without_selecting(state);
+      state->selected_candidate =
+          state->selected_candidate < 0 ? 0 : (state->selected_candidate + 1) % candidate_count;
+      update_candidate_selection(state);
       return TRUE;
     }
     if (keyval == GDK_KEY_Up) {
-      if (state->entry && !gtk_widget_has_focus(state->entry)) {
-        gtk_widget_grab_focus(state->entry);
-      }
-      state->selected_chinese_candidate =
-          (state->selected_chinese_candidate - 1 +
-           (int)state->active_chinese_candidates->len) %
-          (int)state->active_chinese_candidates->len;
-      state->chinese_candidate_navigated = TRUE;
-      update_chinese_candidate_selection(state);
+      focus_entry_without_selecting(state);
+      state->selected_candidate =
+          state->selected_candidate < 0
+              ? candidate_count - 1
+              : (state->selected_candidate - 1 + candidate_count) % candidate_count;
+      update_candidate_selection(state);
       return TRUE;
     }
     if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
-      if (state->entry && !gtk_widget_has_focus(state->entry)) {
-        gtk_widget_grab_focus(state->entry);
-      }
-      if (chinese_candidate_query_is_current(state)) {
-        open_selected_chinese_candidate(state);
-      } else {
-        perform_lookup(state, gtk_editable_get_text(GTK_EDITABLE(state->entry)));
-      }
+      focus_entry_without_selecting(state);
+      submit_current_input(state);
       return TRUE;
     }
   }
 
   if (keyval == GDK_KEY_Down || keyval == GDK_KEY_Up) {
-    if (state->entry && !gtk_widget_has_focus(state->entry)) {
-      gtk_widget_grab_focus(state->entry);
-    }
+    focus_entry_without_selecting(state);
     int direction = keyval == GDK_KEY_Down ? 1 : -1;
 #ifdef MINI_DICT_HAVE_WEBKITGTK
     if (scroll_web_result(state, direction)) {
@@ -1710,6 +1855,89 @@ set_configured_dict_dir(AppState *state, const char *dict_dir)
 }
 
 static int
+suggest_prefix_command(AppState *state,
+                       GApplicationCommandLine *command_line,
+                       const char *prefix)
+{
+  if (!prefix || prefix[0] == '\0') {
+    g_application_command_line_printerr(command_line,
+                                        "Usage: mini-dict --suggest PREFIX [--dict-dir DIR]\n");
+    return 1;
+  }
+
+  g_autofree char *dict_dir = local_dictionary_resolve_dir(state->configured_dict_dir);
+  GError *error = NULL;
+  LocalDictionaryReader *reader = local_dictionary_reader_new(dict_dir, &error);
+  if (!reader) {
+    g_application_command_line_printerr(command_line,
+                                        "Dictionary setup issue: %s\n",
+                                        error ? error->message : "unknown error");
+    g_clear_error(&error);
+    return 1;
+  }
+
+  ChineseIndex *index = chinese_index_new(&error);
+  if (!index) {
+    g_application_command_line_printerr(command_line,
+                                        "Prefix suggestions are unavailable: %s\n",
+                                        error ? error->message : "unknown error");
+    g_clear_error(&error);
+    local_dictionary_reader_free(reader);
+    return 1;
+  }
+
+  gboolean ready = FALSE;
+  int status = 0;
+  GPtrArray *candidates = NULL;
+
+  if (!chinese_index_is_ready(index, reader, &ready, &error)) {
+    g_application_command_line_printerr(command_line,
+                                        "Local entry index is unavailable: %s\n",
+                                        error ? error->message : "unknown error");
+    g_clear_error(&error);
+    status = 1;
+  } else if (!ready) {
+    g_application_command_line_printerr(
+        command_line,
+        "Local entry index is missing or stale. Run --rebuild-chinese-index first.\n");
+    status = 2;
+  } else {
+    gint64 start = g_get_monotonic_time();
+    candidates = chinese_index_prefix_query(index, prefix, PREFIX_SUGGESTION_LIMIT, &error);
+    gint64 elapsed_us = g_get_monotonic_time() - start;
+    if (!candidates) {
+      g_application_command_line_printerr(command_line,
+                                          "Prefix suggestion query failed: %s\n",
+                                          error ? error->message : "unknown error");
+      g_clear_error(&error);
+      status = 1;
+    } else {
+      g_application_command_line_print(command_line,
+                                       "Prefix suggestions for \"%s\": %u shown in %.2f ms\n",
+                                       prefix,
+                                       candidates->len,
+                                       (double)elapsed_us / 1000.0);
+      for (guint i = 0; i < candidates->len; i++) {
+        ChineseIndexCandidate *candidate = g_ptr_array_index(candidates, i);
+        g_application_command_line_print(
+            command_line,
+            "  %s\t%s\t%s\n",
+            candidate->entry_key,
+            candidate->part_of_speech ? candidate->part_of_speech : "-",
+            candidate->snippet ? candidate->snippet : "");
+      }
+    }
+  }
+
+  if (candidates) {
+    g_ptr_array_unref(candidates);
+  }
+  chinese_index_free(index);
+  local_dictionary_reader_free(reader);
+  return status;
+}
+
+static int
 check_local_dictionary_command(AppState *state,
                                GApplicationCommandLine *command_line,
                                const char *query)
@@ -1818,6 +2046,13 @@ on_command_line(GApplication *application,
     return status;
   }
 
+  const char *suggest_prefix = arg_value(args, "--suggest");
+  if (suggest_prefix) {
+    int status = suggest_prefix_command(state, command_line, suggest_prefix);
+    g_strfreev(args);
+    return status;
+  }
+
   if (has_arg(args, "--rebuild-chinese-index")) {
     int status = rebuild_chinese_index_command(state, command_line);
     g_strfreev(args);
@@ -1870,11 +2105,12 @@ app_state_free(AppState *state)
   chinese_index_free(state->chinese_index);
   local_dictionary_reader_free(state->local_reader);
   audio_player_free(state->audio_player);
-  if (state->active_chinese_candidates) {
-    g_ptr_array_unref(state->active_chinese_candidates);
+  clear_prefix_suggestion_timeout(state);
+  if (state->active_candidates) {
+    g_ptr_array_unref(state->active_candidates);
   }
   g_free(state->active_query_key);
-  g_free(state->active_chinese_candidate_query);
+  g_free(state->active_candidate_query);
   g_free(state->pending_chinese_query);
   g_free(state->configured_dict_dir);
   g_free(state->requested_monitor_name);

@@ -77,7 +77,9 @@ ensure_schema(sqlite3 *db, GError **error)
                   "key_class INTEGER NOT NULL"
                   ");"
                   "CREATE VIRTUAL TABLE IF NOT EXISTS chinese_entries_fts "
-                  "USING fts5(entry_key UNINDEXED, chinese_text, tokenize='trigram');",
+                  "USING fts5(entry_key UNINDEXED, chinese_text, tokenize='trigram');"
+                  "CREATE INDEX IF NOT EXISTS chinese_entries_lower_key "
+                  "ON chinese_entries(lower(entry_key));",
                   error);
 }
 
@@ -635,6 +637,106 @@ chinese_index_query(ChineseIndex *index,
     candidate->part_of_speech =
         part_of_speech && part_of_speech[0] ? g_strdup((const char *)part_of_speech) : NULL;
     candidate->snippet = make_snippet((const char *)chinese_text, query);
+    g_ptr_array_add(candidates, candidate);
+  }
+
+  if (rc != SQLITE_DONE) {
+    g_set_error(error, chinese_index_error_quark(), rc, "%s", sqlite3_errmsg(db));
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    g_ptr_array_unref(candidates);
+    return NULL;
+  }
+
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  return candidates;
+}
+
+static char *
+prefix_upper_bound(const char *prefix)
+{
+  gsize len = strlen(prefix);
+  char *upper = g_strdup(prefix);
+  while (len > 0) {
+    unsigned char last = (unsigned char)upper[len - 1];
+    if (last < 0x7f) {
+      upper[len - 1] = (char)(last + 1);
+      upper[len] = '\0';
+      return upper;
+    }
+    len--;
+  }
+
+  g_free(upper);
+  return NULL;
+}
+
+/* The index stores every headword that has a Chinese meaning, so the same table
+ * also answers English headword prefix suggestions. */
+GPtrArray *
+chinese_index_prefix_query(ChineseIndex *index,
+                           const char *prefix,
+                           guint limit,
+                           GError **error)
+{
+  GPtrArray *candidates = g_ptr_array_new_with_free_func(chinese_index_candidate_free);
+  if (!index || !prefix || prefix[0] == '\0' || limit == 0) {
+    return candidates;
+  }
+
+  g_autofree char *lower_prefix = g_utf8_strdown(prefix, -1);
+  g_autofree char *upper_prefix = prefix_upper_bound(lower_prefix);
+  if (!upper_prefix) {
+    return candidates;
+  }
+
+  sqlite3 *db = NULL;
+  if (!open_db(index->db_path, &db, error)) {
+    g_ptr_array_unref(candidates);
+    return NULL;
+  }
+  if (!ensure_schema(db, error)) {
+    sqlite3_close(db);
+    g_ptr_array_unref(candidates);
+    return NULL;
+  }
+
+  sqlite3_stmt *stmt = NULL;
+  const char *sql =
+      "SELECT e.entry_key, e.part_of_speech, e.chinese_text "
+      "FROM chinese_entries e "
+      "WHERE lower(e.entry_key) >= ? AND lower(e.entry_key) < ? "
+      "ORDER BY "
+      "CASE WHEN lower(e.entry_key) = ? THEN 0 ELSE 1 END, "
+      "e.key_class, e.key_len, lower(e.entry_key) "
+      "LIMIT ?";
+  int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+  if (rc != SQLITE_OK) {
+    g_set_error(error, chinese_index_error_quark(), rc, "%s", sqlite3_errmsg(db));
+    sqlite3_close(db);
+    g_ptr_array_unref(candidates);
+    return NULL;
+  }
+
+  sqlite3_bind_text(stmt, 1, lower_prefix, -1, SQLITE_TRANSIENT_VALUE);
+  sqlite3_bind_text(stmt, 2, upper_prefix, -1, SQLITE_TRANSIENT_VALUE);
+  sqlite3_bind_text(stmt, 3, lower_prefix, -1, SQLITE_TRANSIENT_VALUE);
+  sqlite3_bind_int(stmt, 4, (int)limit);
+
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    const unsigned char *entry_key = sqlite3_column_text(stmt, 0);
+    const unsigned char *part_of_speech = sqlite3_column_text(stmt, 1);
+    const unsigned char *chinese_text = sqlite3_column_text(stmt, 2);
+    if (!entry_key) {
+      continue;
+    }
+
+    ChineseIndexCandidate *candidate = g_new0(ChineseIndexCandidate, 1);
+    candidate->entry_key = g_strdup((const char *)entry_key);
+    candidate->part_of_speech =
+        part_of_speech && part_of_speech[0] ? g_strdup((const char *)part_of_speech) : NULL;
+    candidate->snippet = make_snippet((const char *)chinese_text, "");
     g_ptr_array_add(candidates, candidate);
   }
 

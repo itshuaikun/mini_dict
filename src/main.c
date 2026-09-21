@@ -32,6 +32,7 @@ print_help(void)
       "      --dict-dir DIR          Use a local LDOCE dictionary directory\n"
       "      --monitor OUTPUT        Show the lookup window on this output\n"
       "      --check-dict WORD       Check a local dictionary entry and exit\n"
+      "      --suggest PREFIX        Show local headword Prefix Suggestions and exit\n"
       "      --rebuild-chinese-index Rebuild the Chinese reverse lookup index and exit\n"
       "      --clear-cache           Clear cached online fallback results and exit\n"
       "\n"
