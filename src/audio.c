@@ -4,7 +4,6 @@
 
 struct _AudioPlayer {
   GstElement *playbin;
-  GstElement *warmup_pipeline;
   guint bus_watch_id;
   AudioErrorCallback error_callback;
   gpointer error_user_data;
@@ -56,16 +55,6 @@ audio_player_new(void)
 {
   AudioPlayer *player = g_new0(AudioPlayer, 1);
   player->playbin = gst_element_factory_make("playbin", "pronunciation-player");
-  GError *warmup_error = NULL;
-  player->warmup_pipeline =
-      gst_parse_launch("audiotestsrc is-live=true wave=silence volume=0 ! "
-                       "audioconvert ! audioresample ! autoaudiosink sync=false",
-                       &warmup_error);
-  if (player->warmup_pipeline) {
-    gst_element_set_state(player->warmup_pipeline, GST_STATE_PLAYING);
-  } else {
-    g_clear_error(&warmup_error);
-  }
   if (player->playbin) {
     GstBus *bus = gst_element_get_bus(player->playbin);
     player->bus_watch_id = gst_bus_add_watch(bus, audio_bus_callback, player);
@@ -86,10 +75,6 @@ audio_player_free(AudioPlayer *player)
   if (player->playbin) {
     gst_element_set_state(player->playbin, GST_STATE_NULL);
     gst_object_unref(player->playbin);
-  }
-  if (player->warmup_pipeline) {
-    gst_element_set_state(player->warmup_pipeline, GST_STATE_NULL);
-    gst_object_unref(player->warmup_pipeline);
   }
   g_free(player);
 }
